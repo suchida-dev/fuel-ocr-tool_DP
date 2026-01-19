@@ -5,11 +5,11 @@ import pandas as pd
 import json
 import io
 import fitz  # PyMuPDF
-from streamlit_pdf_viewer import pdf_viewer  # 【追加】専用ライブラリ
+import streamlit.components.v1 as components
 
 # --- ページ設定 ---
-st.set_page_config(layout="wide", page_title="燃料明細OCR (PDFビューア版)")
-st.title("⛽ 燃料明細 自動抽出ツール")
+st.set_page_config(layout="wide", page_title="燃料明細OCR (Proビューア版)")
+st.title("⛽ 燃料明細 自動抽出ツール (Proビューア)")
 
 # --- 1. APIキー設定 ---
 api_key = None
@@ -38,20 +38,32 @@ selected_model_name = None
 if available_model_names:
     selected_model_name = st.sidebar.selectbox("使用するモデル", available_model_names)
 
-# --- 3. ファイルアップロード ---
-uploaded_file = st.file_uploader("請求書(PDF/画像)をアップロード", type=["pdf", "png", "jpg", "jpeg"])
+# --- 3. セッション状態の初期化 (ビューア設定) ---
+if 'zoom_level' not in st.session_state:
+    st.session_state['zoom_level'] = 100 # %単位
+if 'rotation' not in st.session_state:
+    st.session_state['rotation'] = 0
 
-# --- 関数: 解析用にPDFを画像リストに変換 ---
+# --- 4. ショートカットキー検知用 JSコンポーネント ---
+# キー入力を検知して、隠しボタンを押すような動作はPython側では難しいため
+# ここではJavaScriptでキー入力を検知し、Streamlitの値を更新するハックは複雑になりすぎるため
+# 「ボタン」をメインにしつつ、キー操作の説明を表示します。
+# ※厳密なショートカット実装はStreamlitの仕様上、外部ライブラリ(streamlit-keyup)が必要ですが、
+# 今回は標準機能のボタンで実装します。
+
+# --- 関数 ---
 def pdf_to_all_images(file_bytes):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     images = []
     for page in doc:
-        pix = page.get_pixmap()
+        pix = page.get_pixmap(dpi=200) # 画質良さげに
         img_data = pix.tobytes("png")
         images.append(Image.open(io.BytesIO(img_data)))
     return images
 
 # --- メイン処理 ---
+uploaded_file = st.file_uploader("請求書(PDF/画像)をアップロード", type=["pdf", "png", "jpg", "jpeg"])
+
 if uploaded_file and api_key and selected_model_name:
     
     # ファイル読み込み
@@ -69,29 +81,65 @@ if uploaded_file and api_key and selected_model_name:
 
     with col1:
         st.subheader("📄 原本プレビュー")
-        # 【修正】ここを専用ライブラリに変更しました
-        if uploaded_file.type == "application/pdf":
-            # widthは親カラムに合わせて自動調整、高さはスクロール可能
-            pdf_viewer(input=file_bytes, width=700, height=800)
-        else:
-            st.image(input_contents[0], use_container_width=True)
+        
+        # --- コントロールバー ---
+        c1, c2, c3, c4, c5 = st.columns(5)
+        
+        # コールバック関数
+        def zoom_in(): st.session_state['zoom_level'] += 10
+        def zoom_out(): st.session_state['zoom_level'] = max(10, st.session_state['zoom_level'] - 10)
+        def rotate_left(): st.session_state['rotation'] = (st.session_state['rotation'] + 90) % 360
+        def rotate_right(): st.session_state['rotation'] = (st.session_state['rotation'] - 90) % 360
+        def reset_view(): 
+            st.session_state['zoom_level'] = 100
+            st.session_state['rotation'] = 0
+
+        with c1: st.button("🔍 拡大 (+)", on_click=zoom_in, use_container_width=True)
+        with c2: st.button("Mw 縮小 (-)", on_click=zoom_out, use_container_width=True)
+        with c3: st.button("Eq 左回転", on_click=rotate_left, use_container_width=True)
+        with c4: st.button("Dw 右回転", on_click=rotate_right, use_container_width=True)
+        with c5: st.button("Reset", on_click=reset_view, use_container_width=True)
+
+        # 現在の状態表示
+        # st.caption(f"ズーム: {st.session_state['zoom_level']}% / 回転: {st.session_state['rotation']}°")
+
+        # --- 画像表示 ---
+        # 拡大率からピクセル幅を計算 (基準幅 700px * %)
+        current_width = int(700 * (st.session_state['zoom_level'] / 100))
+        
+        # 全ページを表示
+        for img in input_contents:
+            # 回転処理
+            if st.session_state['rotation'] != 0:
+                img = img.rotate(st.session_state['rotation'], expand=True)
+            
+            st.image(img, width=current_width)
 
     with col2:
         st.subheader("📊 抽出結果")
         
+        # ショートカットの説明
+        # st.info("💡 ヒント: ボタン連打で調整可能です")
+
         if st.button("抽出を開始する", type="primary"):
             st.info(f"使用モデル: {selected_model_name} / 処理ページ数: {len(input_contents)}枚")
             
             try:
                 model = genai.GenerativeModel(selected_model_name)
                 
+                # 回転済みの画像リストを作成してGeminiに渡す（ここ重要！人間が見ている向きで解析させる）
+                processed_inputs = []
+                for img in input_contents:
+                    if st.session_state['rotation'] != 0:
+                        img = img.rotate(st.session_state['rotation'], expand=True)
+                    processed_inputs.append(img)
+                
                 prompt = """
-                このガソリンスタンドの請求書（全ページ）を解析してください。
+                この請求書画像を解析してください。
                 以下の情報を抽出し、JSON形式で出力してください。Markdownは不要です。
 
                 1. **明細リスト**: 日付、燃料名、使用量(L)、請求額(円)
                    - ページをまたいでいる場合もすべて抽出。
-                   - 軽油税が別行ならそれも明細として抽出。
                    - 明細以外の「合計」行は除外。
                 2. **税区分**: "税込" または "税抜"
                 
@@ -107,12 +155,11 @@ if uploaded_file and api_key and selected_model_name:
                         }
                     ]
                 }
-                数値にはカンマや円マークを入れないでください。
                 """
                 
-                request_content = [prompt] + input_contents
+                request_content = [prompt] + processed_inputs
 
-                with st.spinner("全ページ解析中..."):
+                with st.spinner("解析中..."):
                     response = model.generate_content(request_content)
                 
                 json_text = response.text.replace("```json", "").replace("```", "").strip()
@@ -165,4 +212,4 @@ if uploaded_file and api_key and selected_model_name:
                     st.download_button("CSVダウンロード", csv, "fuel_data.csv", "text/csv")
 
                 except Exception as e:
-                    st.error(f"データ処理中にエラー: {e}")
+                    st.error(f"データ処理エラー: {e}")
