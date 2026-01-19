@@ -229,7 +229,7 @@ if uploaded_file and api_key and selected_model_name:
                             fill_color="rgba(0, 0, 0, 0)",
                             stroke_width=stroke_width,
                             stroke_color=stroke_color,
-                            background_image=resized_img, # PIL画像をそのまま渡す(Numpyはダメ)
+                            background_image=resized_img, # PIL画像をそのまま渡す
                             update_streamlit=True,
                             height=display_height,
                             width=display_width,
@@ -238,10 +238,8 @@ if uploaded_file and api_key and selected_model_name:
                         )
                     except Exception as e:
                         # もしCanvasでエラーが出たら警告を出して通常画像を表示
-                        st.warning("⚠️ お使いの環境では手書き機能が利用できません。通常表示に切り替えます。")
+                        st.warning("⚠️ 手書き機能がエラーを起こしたため、通常表示に切り替えます。")
                         st.image(img, width=display_width)
-                        # エラー詳細（デバッグ用）
-                        # st.caption(f"Error: {e}") 
                 else:
                     st.image(img, width=display_width)
 
