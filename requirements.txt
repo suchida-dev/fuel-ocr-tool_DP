@@ -3,4 +3,4 @@ google-generativeai>=0.5.0
 pandas
 Pillow
 pymupdf
-pip install streamlit-drawable-canvas
+streamlit-drawable-canvas
