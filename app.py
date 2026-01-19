@@ -8,8 +8,8 @@ import fitz  # PyMuPDF
 import os
 
 # --- ページ設定 ---
-st.set_page_config(layout="wide", page_title="燃料明細OCR (共有版)")
-st.title("⛽ 燃料明細 自動抽出ツール")
+st.set_page_config(layout="wide", page_title="その他燃料明細OCR")
+st.title("⛽ その他燃料明細 自動抽出ツール")
 
 # --- 1. APIキー設定 (Secrets対応版) ---
 api_key = None
@@ -148,3 +148,4 @@ if uploaded_file and api_key and selected_model_name:
             
             csv = edited_df.to_csv(index=False).encode('utf-8-sig')
             st.download_button("CSVダウンロード", csv, "fuel_data.csv", "text/csv")
+
