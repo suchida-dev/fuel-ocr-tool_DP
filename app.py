@@ -6,8 +6,15 @@ import json
 import io
 import fitz  # PyMuPDF
 
+# --- 追加ライブラリの読み込み (エラー回避付き) ---
+try:
+    from streamlit_drawable_canvas import st_canvas
+    HAS_CANVAS = True
+except ImportError:
+    HAS_CANVAS = False
+
 # --- ページ設定 ---
-st.set_page_config(layout="wide", page_title="燃料明細OCR (Enhanced)")
+st.set_page_config(layout="wide", page_title="燃料明細OCR (Marker)")
 st.title("⛽ 燃料明細 自動抽出ツール")
 
 # --- CSS: デザイン調整 ---
@@ -19,10 +26,6 @@ st.markdown("""
     }
     div[data-testid="stMetricValue"] {
         font-size: 1.2rem;
-    }
-    /* 合計表のスタイル */
-    [data-testid="stDataFrame"] {
-        margin-bottom: 20px;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -36,7 +39,7 @@ else:
     api_key_input = st.sidebar.text_input("Gemini API Key", type="password")
     api_key = api_key_input.strip() if api_key_input else None
 
-# --- 2. モデル取得 (最新リスト対応) ---
+# --- 2. モデル取得 ---
 available_model_names = []
 if api_key:
     genai.configure(api_key=api_key, transport='rest')
@@ -157,21 +160,80 @@ if uploaded_file and api_key and selected_model_name:
 
     col1, col2 = st.columns([2, 1])
 
-    # --- 左: ビューア ---
+    # --- 左: ビューア (手書き機能付き) ---
     with col1:
-        c1, c2, c3, c4, c5, _ = st.columns([1, 1, 1, 1, 1, 6])
+        # コントロールバー
+        c1, c2, c3, c4, c5, c_toggle = st.columns([1, 1, 1, 1, 1, 3])
         with c1: st.button("➕", on_click=lambda: st.session_state.update({'zoom_level': st.session_state['zoom_level']+25}))
         with c2: st.button("➖", on_click=lambda: st.session_state.update({'zoom_level': max(10, st.session_state['zoom_level']-25)}))
         with c3: st.button("⤵", on_click=lambda: st.session_state.update({'rotation': (st.session_state['rotation']-90)%360}))
         with c4: st.button("⤴", on_click=lambda: st.session_state.update({'rotation': (st.session_state['rotation']+90)%360}))
         with c5: st.button("R", on_click=lambda: st.session_state.update({'zoom_level': 100, 'rotation': 0}))
+        
+        # 手書きモード切り替え
+        use_canvas = False
+        if HAS_CANVAS:
+            with c_toggle:
+                use_canvas = st.toggle("✏️ 手書きモード", value=False)
+        else:
+            with c_toggle:
+                st.caption("※描画ライブラリ未検出")
 
+        # ペン設定（手書きモード時のみ表示）
+        stroke_color = "rgba(255, 255, 0, 0.4)" # デフォルト: 黄色マーカー
+        stroke_width = 20
+        if use_canvas:
+            pen_col1, pen_col2 = st.columns(2)
+            with pen_col1:
+                pen_type = st.radio("ペンの種類", ["蛍光マーカー (黄)", "赤ペン"], horizontal=True, label_visibility="collapsed")
+                if pen_type == "赤ペン":
+                    stroke_color = "rgba(255, 0, 0, 0.8)"
+                    stroke_width = 3
+            st.info("マウスで画像に直接書き込みができます。")
+
+        # 画像表示
         with st.container(height=850):
-            current_width = int(1000 * (st.session_state['zoom_level'] / 100))
-            for img in input_contents:
-                if st.session_state['rotation'] != 0:
-                    img = img.rotate(st.session_state['rotation'], expand=True)
-                st.image(img, width=current_width)
+            current_zoom = st.session_state['zoom_level']
+            current_rot = st.session_state['rotation']
+            
+            # ズーム倍率に応じたサイズ計算
+            # 基準幅を1000pxとし、倍率を掛ける
+            base_width = 1000
+            display_width = int(base_width * (current_zoom / 100))
+            
+            for i, img in enumerate(input_contents):
+                # 回転適用
+                if current_rot != 0:
+                    img = img.rotate(current_rot, expand=True)
+                
+                # リサイズ（キャンバスのサイズ合わせのため）
+                # アスペクト比を維持して計算
+                aspect_ratio = img.height / img.width
+                display_height = int(display_width * aspect_ratio)
+                
+                if use_canvas:
+                    # キャンバス用に画像をリサイズ
+                    resized_img = img.resize((display_width, display_height))
+                    
+                    # キャンバス表示
+                    # keyにfile_id, zoom, rotation, indexを含めることで、状態が変わるたびにリセットする
+                    # (そうしないとズームしたときに描画がずれるため)
+                    canvas_key = f"canvas_{file_id}_{i}_{current_zoom}_{current_rot}"
+                    
+                    st_canvas(
+                        fill_color="rgba(0, 0, 0, 0)", # 塗りつぶしなし
+                        stroke_width=stroke_width,
+                        stroke_color=stroke_color,
+                        background_image=resized_img,
+                        update_streamlit=True,
+                        height=display_height,
+                        width=display_width,
+                        drawing_mode="freedraw",
+                        key=canvas_key,
+                    )
+                else:
+                    # 通常表示 (高速)
+                    st.image(img, width=display_width)
 
     # --- 右: 操作と表 ---
     with col2:
@@ -212,7 +274,6 @@ if uploaded_file and api_key and selected_model_name:
                         else:
                             df = df[required_columns]
                         
-                        # インデックスをリセット（重要）
                         df.reset_index(drop=True, inplace=True)
                         st.session_state['df'] = df
                         st.session_state['tax_type'] = full_data.get("tax_type", "不明")
@@ -223,11 +284,11 @@ if uploaded_file and api_key and selected_model_name:
             except Exception as e:
                 st.error(f"エラー: {e}")
 
-        # --- メインロジック ---
+        # --- 表の表示 ---
         if 'df' in st.session_state and not st.session_state['df'].empty:
             df = st.session_state['df']
             
-            # 型変換 (安全に)
+            # 型変換
             df["使用量"] = pd.to_numeric(df["使用量"], errors='coerce').fillna(0)
             df["請求額"] = pd.to_numeric(df["請求額"], errors='coerce').fillna(0)
             df["日付"] = df["日付"].astype(str).replace("nan", "")
@@ -235,13 +296,9 @@ if uploaded_file and api_key and selected_model_name:
 
             st.markdown(f"**💰 消費税:** `{st.session_state.get('tax_type', '不明')}`")
             
-            # --- 1. 合計値の表を表示 ---
+            # --- 1. 合計表 ---
             st.markdown("##### 📈 集計テーブル")
-            
-            # 燃料ごとの集計
             summary_df = df.groupby("燃料名")[["使用量", "請求額"]].sum().reset_index()
-            
-            # 総合計行を作成
             total_usage = summary_df["使用量"].sum()
             total_cost = summary_df["請求額"].sum()
             total_row = pd.DataFrame({
@@ -249,11 +306,8 @@ if uploaded_file and api_key and selected_model_name:
                 "使用量": [total_usage], 
                 "請求額": [total_cost]
             })
-            
-            # 表示用データフレーム結合
             display_summary = pd.concat([summary_df, total_row], ignore_index=True)
             
-            # 合計表の表示 (編集不可)
             st.dataframe(
                 display_summary, 
                 use_container_width=True, 
@@ -267,25 +321,22 @@ if uploaded_file and api_key and selected_model_name:
             st.markdown("---")
             st.markdown("##### 📝 詳細データ (編集・フィルタ可能)")
 
-            # --- 2. フィルタ機能 ---
-            # 燃料名リストを作成
+            # --- 2. フィルタ ---
             unique_fuels = df["燃料名"].unique().tolist()
             selected_fuels = st.multiselect("🔍 燃料名でフィルタ", unique_fuels, default=unique_fuels)
             
-            # フィルタリング適用 (表示用データ作成)
-            # フィルタが空の場合は全件表示とする
             if not selected_fuels:
                 view_df = df
             else:
                 view_df = df[df["燃料名"].isin(selected_fuels)]
 
-            # --- 3. データエディタ (行追加・修正対応) ---
+            # --- 3. 詳細エディタ ---
             edited_df = st.data_editor(
                 view_df,
-                num_rows="dynamic", # 行追加・削除を許可
+                num_rows="dynamic", 
                 use_container_width=True,
                 hide_index=True,
-                key="editor_main_v1", 
+                key="editor_marker_mode_v1", 
                 column_config={
                     "日付": st.column_config.TextColumn("日付"),
                     "燃料名": st.column_config.TextColumn("燃料名"),
@@ -294,36 +345,27 @@ if uploaded_file and api_key and selected_model_name:
                 }
             )
             
-            # --- 4. 変更検知と同期処理 ---
-            # フィルタされた状態での編集を元のdfに反映させるロジック
+            # --- 4. 同期処理 ---
             if not edited_df.equals(view_df):
-                # 元のdfのコピーを作成
                 new_main_df = st.session_state['df'].copy()
                 
-                # A. 削除の反映
-                # view_dfにあってedited_dfにないインデックスを探す (削除された行)
+                # 削除の反映
                 deleted_indices = set(view_df.index) - set(edited_df.index)
                 if deleted_indices:
                     new_main_df = new_main_df.drop(list(deleted_indices))
                 
-                # B. 更新の反映
-                # 共通するインデックスについて値を更新
+                # 更新の反映
                 common_indices = list(set(edited_df.index) & set(new_main_df.index))
                 if common_indices:
                     new_main_df.update(edited_df.loc[common_indices])
                 
-                # C. 追加の反映
-                # edited_dfにあってview_df(元のインデックス)にない行は「新規追加」
-                # (Streamlitは新規行に新しいインデックスを振るか、RangeIndex外の挙動をする)
+                # 追加の反映
                 new_rows = edited_df[~edited_df.index.isin(view_df.index)]
                 if not new_rows.empty:
                     new_main_df = pd.concat([new_main_df, new_rows], ignore_index=True)
                 
-                # セッション状態を更新してリラン
-                # (インデックスを振り直して整合性を保つ)
                 st.session_state['df'] = new_main_df.reset_index(drop=True)
                 st.rerun()
 
-            # CSVダウンロード
             csv = df.to_csv(index=False).encode('utf-8-sig')
             st.download_button("CSVダウンロード", csv, "fuel_data.csv", "text/csv", use_container_width=True)
