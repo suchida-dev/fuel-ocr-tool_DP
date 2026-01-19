@@ -7,7 +7,7 @@ import io
 import fitz  # PyMuPDF
 
 # --- ページ設定 ---
-st.set_page_config(layout="wide", page_title="燃料明細OCR (Clean Columns)")
+st.set_page_config(layout="wide", page_title="燃料明細OCR (Filtered)")
 st.title("⛽ 燃料明細 自動抽出ツール")
 
 # --- CSS: デザイン調整 ---
@@ -75,10 +75,21 @@ def extract_json(text):
     except:
         return None
 
-# --- 関数: データの強制整形 (列が増えるのを防ぐ) ---
+# --- 関数: データの強制整形 & フィルタリング ---
 def clean_data_items(items):
-    """AIが返すキーの揺らぎ（使用量(L), 金額など）を吸収して4列に統一する"""
+    """
+    1. キーの表記ゆれを修正
+    2. 除外キーワードが含まれる行を強制削除
+    """
     cleaned_list = []
+    
+    # 除外するキーワードリスト（ここにゴミデータの特徴を追加）
+    exclude_keywords = [
+        "電気", "ガス", "基本料金", "水道", 
+        "オイル", "交換", "工賃", "タイヤ", "バッテリー", 
+        "エレメント", "洗車", "部品", "ワイパー", "ウォッシャー"
+    ]
+
     for item in items:
         new_row = {
             "日付": "",
@@ -86,29 +97,45 @@ def clean_data_items(items):
             "使用量": 0,
             "請求額": 0
         }
-        # 辞書のキーを見て、適切な列に割り振る
+        
+        # 1. データのマッピング
         for k, v in item.items():
             key_str = str(k)
-            # 日付系
+            val_str = str(v)
+            
+            # 日付
             if any(x in key_str for x in ["日付", "Date", "date", "day"]):
-                new_row["日付"] = v
-            # 燃料名系
-            elif any(x in key_str for x in ["燃料", "品名", "商品", "name", "Name", "item"]):
-                new_row["燃料名"] = v
-            # 使用量系 (L, 数量, amountなど)
+                new_row["日付"] = val_str
+            # 燃料名
+            elif any(x in key_str for x in ["燃料", "品名", "商品", "name"]):
+                new_row["燃料名"] = val_str
+            # 使用量
             elif any(x in key_str for x in ["使用量", "数量", "L", "amount", "vol"]):
-                try:
-                    new_row["使用量"] = float(str(v).replace(",", ""))
-                except:
-                    new_row["使用量"] = 0
-            # 金額系 (円, 請求額, priceなど)
-            elif any(x in key_str for x in ["請求額", "金額", "価格", "price", "cost", "円"]):
-                try:
-                    new_row["請求額"] = float(str(v).replace(",", ""))
-                except:
-                    new_row["請求額"] = 0
+                try: new_row["使用量"] = float(val_str.replace(",", ""))
+                except: new_row["使用量"] = 0
+            # 請求額
+            elif any(x in key_str for x in ["請求額", "金額", "price", "円"]):
+                try: new_row["請求額"] = float(val_str.replace(",", ""))
+                except: new_row["請求額"] = 0
         
-        cleaned_list.append(new_row)
+        # 2. 強制フィルタリング（除外キーワードが燃料名に含まれていたらリストに入れない）
+        fuel_name = new_row["燃料名"]
+        
+        # "ガス" という文字が含まれていても "ガソリン" は除外してはいけない
+        is_gasoline = "ガソリン" in fuel_name
+        
+        should_exclude = False
+        for kw in exclude_keywords:
+            if kw in fuel_name:
+                # 「ガス」が含まれていても「ガソリン」ならOK
+                if kw == "ガス" and is_gasoline:
+                    continue
+                should_exclude = True
+                break
+        
+        if not should_exclude:
+            cleaned_list.append(new_row)
+
     return cleaned_list
 
 # --- メイン処理 ---
@@ -168,10 +195,13 @@ if uploaded_file and api_key and selected_model_name:
                         img = img.rotate(st.session_state['rotation'], expand=True)
                     processed_inputs.append(img)
                 
+                # ★プロンプトの強化: 除外対象を明確に指示
                 prompt = """
                 請求書画像を解析し、JSON形式で出力してください。Markdownは不要。
                 
                 1. **items**: 明細リスト (日付, 燃料名, 使用量(L), 請求額(円))
+                   - **抽出対象**: ガソリン(レギュラー, ハイオク), 軽油, 灯油, 重油, 軽油税など、**CO2を排出する燃料のみ**。
+                   - **徹底除外**: 電気代, ガス代(公共料金), 水道, オイル交換, タイヤ交換, 工賃, 部品代, 洗車代, 車検費用, バッテリーなど。
                    - 合計行は除外。
                    - キー名は必ず "日付", "燃料名", "使用量", "請求額" に統一すること。
                 2. **tax_type**: "税込" または "税抜"
@@ -183,17 +213,15 @@ if uploaded_file and api_key and selected_model_name:
                     
                     if full_data:
                         raw_items = full_data.get("items", [])
-                        # ここで強力に列を統一する
+                        # Python側でもフィルタリング実行
                         cleaned_items = clean_data_items(raw_items)
                         
                         df = pd.DataFrame(cleaned_items)
                         
-                        # DataFrameが空の場合でも、必ず4列を作る
                         required_columns = ["日付", "燃料名", "使用量", "請求額"]
                         if df.empty:
                             df = pd.DataFrame(columns=required_columns)
                         else:
-                            # 必要な列だけに絞り込む (余計な列を削除)
                             df = df[required_columns]
 
                         st.session_state['df'] = df
@@ -209,7 +237,7 @@ if uploaded_file and api_key and selected_model_name:
         if 'df' in st.session_state and not st.session_state['df'].empty:
             df = st.session_state['df']
             
-            # 数値変換 (念のため再変換)
+            # 数値変換
             df["使用量"] = pd.to_numeric(df["使用量"], errors='coerce').fillna(0)
             df["請求額"] = pd.to_numeric(df["請求額"], errors='coerce').fillna(0)
             df["日付"] = df["日付"].astype(str).replace("nan", "")
@@ -231,7 +259,7 @@ if uploaded_file and api_key and selected_model_name:
                 num_rows="dynamic", 
                 use_container_width=True,
                 hide_index=True,
-                key="editor_fixed_columns", # キーを一新
+                key="editor_filtered_v1", 
                 column_config={
                     "日付": st.column_config.TextColumn("日付"),
                     "燃料名": st.column_config.TextColumn("燃料名"),
