@@ -7,11 +7,8 @@ import io
 import fitz  # PyMuPDF
 
 # --- ページ設定 ---
-st.set_page_config(layout="wide", page_title="燃料明細OCR (Final)")
+st.set_page_config(layout="wide", page_title="燃料明細OCR (Highlight)")
 st.title("⛽ 燃料明細 自動抽出ツール")
-
-# バージョン確認用（画面の隅に表示しておきます）
-st.caption(f"System Version: {st.__version__}")
 
 # --- CSS ---
 st.markdown("""
@@ -42,7 +39,6 @@ if api_key:
 
 selected_model_name = None
 if available_model_names:
-    # 2.5系やexp系はエラーが出やすいので、安定版を推奨
     selected_model_name = st.sidebar.selectbox("使用モデル", available_model_names, index=0)
 
 # --- 3. セッション初期化 ---
@@ -75,7 +71,6 @@ def get_pdf_images(file_bytes, texts_to_highlight=None):
 # --- メイン処理 ---
 uploaded_file = st.file_uploader("請求書(PDF/画像)をアップロード", type=["pdf", "png", "jpg"])
 
-# ファイル変更時にリセット
 if uploaded_file:
     file_id = uploaded_file.name + str(uploaded_file.size)
     if st.session_state['last_file_id'] != file_id:
@@ -88,7 +83,6 @@ if uploaded_file:
 
 if uploaded_file and api_key and selected_model_name:
     file_bytes = uploaded_file.read()
-    
     col1, col2 = st.columns([1.5, 1])
 
     # --- 左: ビューア ---
@@ -119,7 +113,6 @@ if uploaded_file and api_key and selected_model_name:
         if st.button("🚀 抽出実行", type="primary", use_container_width=True):
             try:
                 model = genai.GenerativeModel(selected_model_name)
-                
                 inputs = []
                 if uploaded_file.type == "application/pdf":
                     raw_images = get_pdf_images(file_bytes, None)
@@ -132,7 +125,8 @@ if uploaded_file and api_key and selected_model_name:
                      inputs.append(img)
 
                 prompt = """
-                請求書画像を解析し、以下の情報をJSON形式のみで出力してください。Markdownコードブロックは不要。
+                請求書画像を解析し、以下の情報をJSON形式のみで出力してください。
+                Markdownコードブロックは不要。
                 
                 1. **items**: 以下のリスト
                    - 日付 (MM-DD)
@@ -150,11 +144,9 @@ if uploaded_file and api_key and selected_model_name:
                     text = res.text.replace("```json", "").replace("```", "").strip()
                     if text.startswith("JSON"): text = text[4:]
                     data = json.loads(text)
-                    
                     st.session_state['df'] = pd.DataFrame(data["items"])
                     st.session_state['tax_type'] = data.get("tax", "不明")
                     st.session_state['highlight_text'] = []
-                    
                     st.toast("抽出完了", icon="✅")
 
             except Exception as e:
@@ -168,7 +160,7 @@ if uploaded_file and api_key and selected_model_name:
 
             st.markdown(f"**💰 消費税区分:** `{st.session_state.get('tax_type')}`")
 
-            # 集計
+            # 集計サマリ
             st.markdown("##### 📊 集計サマリ")
             summary_df = df.groupby("燃料名")[["使用量", "請求額"]].sum().reset_index()
             total_row = pd.DataFrame({
@@ -189,14 +181,14 @@ if uploaded_file and api_key and selected_model_name:
             st.markdown("---")
             st.markdown("##### 📝 詳細データ")
 
-            # --- 決定版エディタ ---
-            # キーを "editor_v2" に変更して、古いキャッシュを無効化します
+            # --- 修正箇所: num_rows="fixed" に変更 ---
+            # これで selection_mode との競合エラーが消えます
             edited_df = st.data_editor(
                 df,
-                num_rows="dynamic",
+                num_rows="fixed",       # 【重要】ここを dynamic から fixed に変更
                 use_container_width=True,
                 hide_index=True,
-                key="editor_v2",  # 【重要】ここを変えました！
+                key="editor_fixed",      # キーを新しくしてキャッシュ回避
                 selection_mode="single-row",
                 column_config={
                     "日付": st.column_config.TextColumn(),
@@ -206,10 +198,9 @@ if uploaded_file and api_key and selected_model_name:
                 }
             )
             
-            # --- ハイライト処理 ---
-            # キーを変えたので session_state.editor_v2 を参照
-            if "editor_v2" in st.session_state and st.session_state.editor_v2.get("selection"):
-                selection = st.session_state.editor_v2["selection"]
+            # ハイライト処理
+            if "editor_fixed" in st.session_state and st.session_state.editor_fixed.get("selection"):
+                selection = st.session_state.editor_fixed["selection"]
                 if selection.get("rows"):
                     row_idx = selection["rows"][0]
                     if row_idx < len(edited_df):
@@ -227,11 +218,11 @@ if uploaded_file and api_key and selected_model_name:
                     st.session_state['highlight_text'] = []
                     st.rerun()
 
-            # 変更検知
+            # データ修正の反映
             if not edited_df.equals(st.session_state['df']):
                 st.session_state['df'] = edited_df
                 st.rerun() 
 
-            # CSV
+            # CSVダウンロード
             csv = edited_df.to_csv(index=False).encode('utf-8-sig')
             st.download_button("CSVダウンロード", csv, "fuel_data.csv", "text/csv", use_container_width=True)
