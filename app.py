@@ -5,13 +5,12 @@ import pandas as pd
 import json
 import io
 import fitz  # PyMuPDF
+import re
 
 # --- ページ設定 ---
-st.set_page_config(layout="wide", page_title="燃料明細OCR (v1.53)")
+st.set_page_config(layout="wide", page_title="燃料明細OCR (Fix JSON)")
 st.title("⛽ 燃料明細 自動抽出ツール")
-
-# デバッグ表示（確認用）
-st.caption(f"System Version: {st.__version__} (OK)")
+st.caption(f"System Version: {st.__version__}")
 
 # --- CSS ---
 st.markdown("""
@@ -51,7 +50,7 @@ if 'df' not in st.session_state: st.session_state['df'] = pd.DataFrame()
 if 'highlight_text' not in st.session_state: st.session_state['highlight_text'] = []
 if 'last_file_id' not in st.session_state: st.session_state['last_file_id'] = None
 
-# --- 関数 ---
+# --- 関数: PDF画像化 ---
 def get_pdf_images(file_bytes, texts_to_highlight=None):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     images = []
@@ -67,6 +66,22 @@ def get_pdf_images(file_bytes, texts_to_highlight=None):
         img_data = pix.tobytes("png")
         images.append(Image.open(io.BytesIO(img_data)))
     return images
+
+# --- 関数: 強力なJSON抽出 ---
+def extract_json(text):
+    """AIの回答からJSON部分だけを無理やり抜き出す"""
+    try:
+        # 最初の '{' と 最後の '}' を探す
+        start = text.find('{')
+        end = text.rfind('}') + 1
+        if start != -1 and end != -1:
+            json_str = text[start:end]
+            return json.loads(json_str)
+        else:
+            # 見つからない場合は通常パースを試みる
+            return json.loads(text)
+    except json.JSONDecodeError:
+        return None
 
 # --- メイン処理 ---
 uploaded_file = st.file_uploader("請求書(PDF/画像)をアップロード", type=["pdf", "png", "jpg"])
@@ -122,7 +137,8 @@ if uploaded_file and api_key and selected_model_name:
                      inputs.append(img)
 
                 prompt = """
-                請求書画像を解析し、以下の情報をJSON形式のみで出力してください。
+                請求書画像を解析し、以下の情報をJSON形式のみで出力してください。Markdownのコードブロック（```json）は不要です。
+                
                 1. **items**: 以下のリスト
                    - 日付 (MM-DD)
                    - 燃料名 (ガソリン, 軽油, 灯油, 重油, 軽油税などCO2排出対象のみ。洗車等は除外)
@@ -130,15 +146,21 @@ if uploaded_file and api_key and selected_model_name:
                    - 請求額 (円) 数値
                 2. **tax**: "税込" or "税抜"
                 """
+                
                 with st.spinner("解析中..."):
                     res = model.generate_content([prompt] + inputs)
-                    text = res.text.replace("```json", "").replace("```", "").strip()
-                    if text.startswith("JSON"): text = text[4:]
-                    data = json.loads(text)
-                    st.session_state['df'] = pd.DataFrame(data["items"])
-                    st.session_state['tax_type'] = data.get("tax", "不明")
-                    st.session_state['highlight_text'] = []
-                    st.toast("完了", icon="✅")
+                    # ここで新しい抽出関数を使う
+                    data = extract_json(res.text)
+                    
+                    if data:
+                        st.session_state['df'] = pd.DataFrame(data.get("items", []))
+                        st.session_state['tax_type'] = data.get("tax", "不明")
+                        st.session_state['highlight_text'] = []
+                        st.toast("完了", icon="✅")
+                    else:
+                        st.error("AIからの回答を解析できませんでした。")
+                        with st.expander("AIの生の回答を確認"):
+                            st.text(res.text)
 
             except Exception as e:
                 st.error(f"エラー: {e}")
@@ -153,7 +175,7 @@ if uploaded_file and api_key and selected_model_name:
 
             st.markdown(f"**💰 消費税:** `{st.session_state.get('tax_type')}`")
 
-            # 集計
+            # 集計サマリ
             st.markdown("##### 📊 集計サマリ")
             summary_df = df.groupby("燃料名")[["使用量", "請求額"]].sum().reset_index()
             total_row = pd.DataFrame({
@@ -174,15 +196,12 @@ if uploaded_file and api_key and selected_model_name:
             st.markdown("---")
             st.markdown("##### 📝 詳細データ")
 
-            # --- ここが修正ポイント ---
-            # 1. num_rows="fixed" を削除 (デフォルト任せにする)
-            # 2. try-except を削除 (1.53.0ならエラーは出ないはず)
             edited_df = st.data_editor(
                 df,
                 use_container_width=True,
                 hide_index=True,
-                key="editor_v153",      # キーを一新
-                selection_mode="single-row", # これが機能します
+                key="editor_final",
+                selection_mode="single-row",
                 column_config={
                     "日付": st.column_config.TextColumn(),
                     "燃料名": st.column_config.TextColumn(),
@@ -192,8 +211,8 @@ if uploaded_file and api_key and selected_model_name:
             )
             
             # ハイライト処理
-            if "editor_v153" in st.session_state and st.session_state.editor_v153.get("selection"):
-                selection = st.session_state.editor_v153["selection"]
+            if "editor_final" in st.session_state and st.session_state.editor_final.get("selection"):
+                selection = st.session_state.editor_final["selection"]
                 if selection.get("rows"):
                     row_idx = selection["rows"][0]
                     if row_idx < len(edited_df):
