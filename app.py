@@ -7,15 +7,13 @@ import io
 import fitz  # PyMuPDF
 
 # --- ページ設定 ---
-st.set_page_config(layout="wide", page_title="燃料明細OCR (Complete)")
-st.title("⛽ 燃料明細 自動抽出ツール (CO2排出対象のみ)")
+st.set_page_config(layout="wide", page_title="燃料明細OCR (Safe Mode)")
+st.title("⛽ 燃料明細 自動抽出ツール")
 
 # --- CSS: デザイン調整 ---
 st.markdown("""
     <style>
-    /* ボタンを太字に */
     .stButton button { font-weight: bold; }
-    /* 集計表の文字サイズ調整 */
     div[data-testid="stMetricValue"] { font-size: 1.2rem; }
     </style>
 """, unsafe_allow_html=True)
@@ -47,24 +45,13 @@ if available_model_names:
 if 'zoom_level' not in st.session_state: st.session_state['zoom_level'] = 100
 if 'rotation' not in st.session_state: st.session_state['rotation'] = 0
 if 'df' not in st.session_state: st.session_state['df'] = pd.DataFrame()
-if 'highlight_text' not in st.session_state: st.session_state['highlight_text'] = []
 if 'last_file_id' not in st.session_state: st.session_state['last_file_id'] = None
 
-# --- 関数: PDFを画像化 + マーカー描画 ---
-def get_pdf_images(file_bytes, texts_to_highlight=None):
+# --- 関数: PDF画像化 ---
+def get_pdf_images(file_bytes):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     images = []
-    
     for page in doc:
-        # ハイライト処理
-        if texts_to_highlight:
-            for text in texts_to_highlight:
-                if text and len(str(text)) > 0:
-                    quads = page.search_for(str(text))
-                    for quad in quads:
-                        page.draw_rect(quad, color=(1, 0, 0), width=4, fill_opacity=0.2, fill=(1, 0.8, 0.8))
-
-        # 画像化
         pix = page.get_pixmap(dpi=150)
         img_data = pix.tobytes("png")
         images.append(Image.open(io.BytesIO(img_data)))
@@ -79,7 +66,6 @@ if uploaded_file:
     if st.session_state['last_file_id'] != file_id:
         st.session_state['last_file_id'] = file_id
         st.session_state['df'] = pd.DataFrame()
-        st.session_state['highlight_text'] = []
         st.session_state['tax_type'] = "ー"
         st.session_state['zoom_level'] = 100
         st.session_state['rotation'] = 0
@@ -100,7 +86,7 @@ if uploaded_file and api_key and selected_model_name:
 
         display_images = []
         if uploaded_file.type == "application/pdf":
-            display_images = get_pdf_images(file_bytes, st.session_state['highlight_text'])
+            display_images = get_pdf_images(file_bytes)
         else:
             img = Image.open(io.BytesIO(file_bytes))
             display_images = [img]
@@ -119,17 +105,12 @@ if uploaded_file and api_key and selected_model_name:
                 model = genai.GenerativeModel(selected_model_name)
                 
                 inputs = []
-                if uploaded_file.type == "application/pdf":
-                    raw_images = get_pdf_images(file_bytes, None)
-                else:
-                    raw_images = [Image.open(io.BytesIO(file_bytes))]
-                
-                for img in raw_images:
-                    if st.session_state['rotation']:
+                for img in display_images:
+                     if st.session_state['rotation']:
                         img = img.rotate(st.session_state['rotation'], expand=True)
-                    inputs.append(img)
+                     inputs.append(img)
 
-                # --- プロンプトの修正部分 ---
+                # --- プロンプト (CO2排出対象のみ) ---
                 prompt = """
                 この請求書画像を解析し、以下の情報をJSON形式のみで出力してください。Markdownコードブロックは不要です。
                 
@@ -156,18 +137,17 @@ if uploaded_file and api_key and selected_model_name:
                     
                     st.session_state['df'] = pd.DataFrame(data["items"])
                     st.session_state['tax_type'] = data.get("tax", "不明")
-                    st.session_state['highlight_text'] = []
                     
-                    st.toast("抽出が完了しました！", icon="✅")
+                    st.toast("抽出完了", icon="✅")
 
             except Exception as e:
                 st.error(f"エラーが発生しました: {e}")
-                st.info("※「429」エラーの場合はAPI制限です。数分待ってから再試行してください。")
 
         # --- 結果表示 ---
         if not st.session_state['df'].empty:
             df = st.session_state['df']
             
+            # 数値変換
             df["使用量"] = pd.to_numeric(df["使用量"], errors='coerce').fillna(0)
             df["請求額"] = pd.to_numeric(df["請求額"], errors='coerce').fillna(0)
 
@@ -198,16 +178,14 @@ if uploaded_file and api_key and selected_model_name:
 
             st.markdown("---")
             st.markdown("##### 📝 詳細データ")
-            st.caption("行をクリックすると、PDF内の該当箇所を赤枠で表示します。")
 
-            # 詳細エディタ
+            # 詳細エディタ (安全版: selection_mode を削除)
             edited_df = st.data_editor(
                 df,
                 num_rows="dynamic",
                 use_container_width=True,
                 hide_index=True,
                 key="editor",
-                selection_mode="single-row",
                 column_config={
                     "日付": st.column_config.TextColumn(),
                     "燃料名": st.column_config.TextColumn(),
@@ -216,37 +194,11 @@ if uploaded_file and api_key and selected_model_name:
                 }
             )
 
-            # 変更検知
+            # 変更検知 (自動再計算)
             if not edited_df.equals(st.session_state['df']):
                 st.session_state['df'] = edited_df
                 st.rerun() 
 
-            # 行選択ハイライト
-            if "editor" in st.session_state and st.session_state.editor.get("selection"):
-                selection = st.session_state.editor["selection"]
-                if selection.get("rows"):
-                    row_idx = selection["rows"][0]
-                    if row_idx < len(edited_df):
-                        selected_row = edited_df.iloc[row_idx]
-                        targets = [
-                            str(selected_row["日付"]),
-                            str(int(selected_row["請求額"])), 
-                            str(selected_row["燃料名"])
-                        ]
-                        if st.session_state['highlight_text'] != targets:
-                            st.session_state['highlight_text'] = targets
-                            st.rerun()
-            else:
-                if st.session_state['highlight_text']:
-                    st.session_state['highlight_text'] = []
-                    st.rerun()
-
             # CSVダウンロード
             csv = edited_df.to_csv(index=False).encode('utf-8-sig')
-            st.download_button(
-                label="CSVダウンロード",
-                data=csv,
-                file_name="fuel_data.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
+            st.download_button("CSVダウンロード", csv, "fuel_data.csv", "text/csv", use_container_width=True)
