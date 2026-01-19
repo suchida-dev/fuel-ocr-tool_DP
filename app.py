@@ -8,7 +8,7 @@ import fitz  # PyMuPDF
 import re
 
 # --- ページ設定 ---
-st.set_page_config(layout="wide", page_title="燃料明細OCR (Safe)")
+st.set_page_config(layout="wide", page_title="燃料明細OCR (Final)")
 st.title("⛽ 燃料明細 自動抽出ツール")
 st.caption(f"System Version: {st.__version__}")
 
@@ -155,30 +155,24 @@ if uploaded_file and api_key and selected_model_name:
                     data = extract_json(res.text)
                     
                     if data:
-                        # --- ここでKeyError対策を実施 ---
+                        # --- 強制データチェック（KeyError防止） ---
                         df_new = pd.DataFrame(data.get("items", []))
                         
-                        # 必須カラムを定義
+                        # 必要なカラムがなければ強制的に作る
                         required_cols = ["日付", "燃料名", "使用量", "請求額"]
-                        
-                        # データが空の場合でもカラムだけは作る
                         if df_new.empty:
                             df_new = pd.DataFrame(columns=required_cols)
                         
-                        # 不足しているカラムがあれば初期値で埋める
                         for col in required_cols:
                             if col not in df_new.columns:
-                                if col in ["使用量", "請求額"]:
-                                    df_new[col] = 0
-                                else:
-                                    df_new[col] = ""
+                                df_new[col] = 0 if col in ["使用量", "請求額"] else ""
                                     
                         st.session_state['df'] = df_new
                         st.session_state['tax_type'] = data.get("tax", "不明")
                         st.session_state['highlight_text'] = []
                         st.toast("完了", icon="✅")
                     else:
-                        st.error("解析失敗: AIの応答形式が不正です。再試行してください。")
+                        st.error("解析失敗: データ形式が読み取れませんでした。")
 
             except Exception as e:
                 st.error(f"エラー: {e}")
@@ -187,9 +181,13 @@ if uploaded_file and api_key and selected_model_name:
             df = st.session_state['df']
             df.reset_index(drop=True, inplace=True)
             
-            # 安全に数値変換（カラムが存在することが保証されているためエラーにならない）
+            # 数値変換（エラーが出ないように安全に）
             df["使用量"] = pd.to_numeric(df["使用量"], errors='coerce').fillna(0)
             df["請求額"] = pd.to_numeric(df["請求額"], errors='coerce').fillna(0)
+            
+            # 文字列型に統一（表示用）
+            df["日付"] = df["日付"].astype(str)
+            df["燃料名"] = df["燃料名"].astype(str)
 
             st.markdown(f"**💰 消費税:** `{st.session_state.get('tax_type')}`")
 
@@ -212,42 +210,54 @@ if uploaded_file and api_key and selected_model_name:
             st.markdown("---")
             st.markdown("##### 📝 詳細データ")
 
-            edited_df = st.data_editor(
-                df,
-                use_container_width=True,
-                hide_index=True,
-                key="editor_safe",
-                selection_mode="single-row",
-                column_config={
-                    "日付": st.column_config.TextColumn(),
-                    "燃料名": st.column_config.TextColumn(),
-                    "請求額": st.column_config.NumberColumn(format="¥%d"),
-                    "使用量": st.column_config.NumberColumn(format="%.2f L"),
-                }
-            )
-            
-            if "editor_safe" in st.session_state and st.session_state.editor_safe.get("selection"):
-                selection = st.session_state.editor_safe["selection"]
-                if selection.get("rows"):
-                    row_idx = selection["rows"][0]
-                    if row_idx < len(edited_df):
-                        selected_row = edited_df.iloc[row_idx]
-                        targets = [
-                            str(selected_row["日付"]),
-                            str(int(selected_row["請求額"])), 
-                            str(selected_row["燃料名"])
-                        ]
-                        if st.session_state['highlight_text'] != targets:
-                            st.session_state['highlight_text'] = targets
-                            st.rerun()
-            else:
-                if st.session_state['highlight_text']:
-                    st.session_state['highlight_text'] = []
-                    st.rerun()
+            # --- ここが修正ポイント ---
+            # 1. keyを "editor_v2026" に変更（キャッシュをクリアしてTypeErrorを解消）
+            # 2. try-except で囲む（万が一エラーになってもアプリを落とさない）
+            try:
+                edited_df = st.data_editor(
+                    df,
+                    use_container_width=True,
+                    hide_index=True,
+                    key="editor_v2026",  # ← 新しい名前に変更！
+                    selection_mode="single-row",
+                    column_config={
+                        "日付": st.column_config.TextColumn(),
+                        "燃料名": st.column_config.TextColumn(),
+                        "請求額": st.column_config.NumberColumn(format="¥%d"),
+                        "使用量": st.column_config.NumberColumn(format="%.2f L"),
+                    }
+                )
 
-            if not edited_df.equals(st.session_state['df']):
-                st.session_state['df'] = edited_df
-                st.rerun() 
+                # ハイライト機能
+                if "editor_v2026" in st.session_state and st.session_state.editor_v2026.get("selection"):
+                    selection = st.session_state.editor_v2026["selection"]
+                    if selection.get("rows"):
+                        row_idx = selection["rows"][0]
+                        if row_idx < len(edited_df):
+                            selected_row = edited_df.iloc[row_idx]
+                            targets = [
+                                str(selected_row["日付"]),
+                                str(int(selected_row["請求額"])), 
+                                str(selected_row["燃料名"])
+                            ]
+                            if st.session_state['highlight_text'] != targets:
+                                st.session_state['highlight_text'] = targets
+                                st.rerun()
+                else:
+                    if st.session_state['highlight_text']:
+                        st.session_state['highlight_text'] = []
+                        st.rerun()
 
-            csv = edited_df.to_csv(index=False).encode('utf-8-sig')
-            st.download_button("CSVダウンロード", csv, "fuel_data.csv", "text/csv", use_container_width=True)
+                if not edited_df.equals(st.session_state['df']):
+                    st.session_state['df'] = edited_df
+                    st.rerun() 
+                
+                # CSVダウンロード
+                csv = edited_df.to_csv(index=False).encode('utf-8-sig')
+                st.download_button("CSVダウンロード", csv, "fuel_data.csv", "text/csv", use_container_width=True)
+
+            except Exception as e:
+                # もしエディタが壊れても、最低限の表だけは表示する（安全策）
+                st.error("⚠️ エディタの表示に失敗しましたが、データは安全です。")
+                st.dataframe(df)
+                st.caption(f"Error details: {e}")
