@@ -1,4 +1,6 @@
 import streamlit as st
+st.write(f"現在のバージョン: {st.__version__}") # ← これを追加
+import streamlit as st
 import google.generativeai as genai
 from PIL import Image
 import pandas as pd
@@ -265,3 +267,4 @@ if uploaded_file and api_key and selected_model_name:
             # CSVダウンロード
             csv = edited_df.to_csv(index=False).encode('utf-8-sig')
             st.download_button("CSVダウンロード", csv, "fuel_data.csv", "text/csv", use_container_width=True)
+
