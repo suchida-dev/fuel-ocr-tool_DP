@@ -8,8 +8,8 @@ import fitz  # PyMuPDF
 import os
 
 # --- ページ設定 ---
-st.set_page_config(layout="wide", page_title="その他燃料明細OCR")
-st.title("⛽ その他燃料明細 自動抽出ツール")
+st.set_page_config(layout="wide", page_title="燃料明細OCR (エラー判定版)")
+st.title("⛽ 燃料明細 自動抽出ツール")
 
 # --- 1. APIキー設定 (Secrets対応版) ---
 api_key = None
@@ -119,33 +119,24 @@ if uploaded_file and api_key and selected_model_name:
             except Exception as e:
                 st.error(f"エラーが発生しました: {e}")
 
+        # --- 結果表示とエラーハンドリング ---
         if 'df' in st.session_state:
             df = st.session_state['df']
             tax_type = st.session_state.get('tax_type', '不明')
 
-            df["使用量"] = pd.to_numeric(df["使用量"], errors='coerce').fillna(0)
-            df["請求額"] = pd.to_numeric(df["請求額"], errors='coerce').fillna(0)
+            # 【重要】カラムチェック: 必要な列がない＝想定外のデータ（電気・ガスなど）
+            required_cols = ["使用量", "請求額", "燃料名"]
+            missing_cols = [c for c in required_cols if c not in df.columns]
 
-            st.markdown(f"**💰 消費税区分:** `{tax_type}`")
-            st.markdown("##### ⛽ 燃料別合計")
-            
-            grouped = df.groupby("燃料名")[["使用量", "請求額"]].sum().reset_index()
-            for index, row in grouped.iterrows():
-                usage_str = f"{row['使用量']:.2f} L" if row['使用量'] > 0 else "-"
-                st.info(f"**{row['燃料名']}**: {usage_str} / ¥{row['請求額']:,.0f}")
-
-            st.markdown("---")
-
-            edited_df = st.data_editor(
-                df,
-                num_rows="dynamic",
-                use_container_width=True,
-                column_config={
-                    "請求額": st.column_config.NumberColumn(format="¥%d"),
-                    "使用量": st.column_config.NumberColumn(format="%.2f L"),
-                }
-            )
-            
-            csv = edited_df.to_csv(index=False).encode('utf-8-sig')
-            st.download_button("CSVダウンロード", csv, "fuel_data.csv", "text/csv")
-
+            if missing_cols:
+                # 必要なカラムが足りない場合のエラー表示
+                st.error("電気もしくはガスのデータです。データを再確認してください。")
+                
+                # 参考のために何が取れたかだけ表示（デバッグ用）
+                with st.expander("詳細データ（参考）"):
+                    st.dataframe(df)
+            else:
+                # 正常な燃料データの場合のみ処理を続行
+                try:
+                    df["使用量"] = pd.to_numeric(df["使用量"], errors='coerce').fillna(0)
+                    df["請求額"] = pd.to_numeric(df["
