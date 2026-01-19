@@ -5,7 +5,7 @@ import pandas as pd
 import json
 import io
 import fitz  # PyMuPDF
-import numpy as np # 画像変換用にnumpyを追加
+import re
 
 # --- 追加ライブラリの読み込み check ---
 try:
@@ -15,7 +15,7 @@ except ImportError:
     HAS_CANVAS = False
 
 # --- ページ設定 ---
-st.set_page_config(layout="wide", page_title="燃料明細OCR (Canvas Fix)")
+st.set_page_config(layout="wide", page_title="燃料明細OCR (Safe Mode)")
 st.title("⛽ 燃料明細 自動抽出ツール")
 
 # --- CSS: デザイン調整 ---
@@ -73,7 +73,7 @@ if 'rotation' not in st.session_state: st.session_state['rotation'] = 0
 if 'df' not in st.session_state: st.session_state['df'] = pd.DataFrame()
 if 'last_file_id' not in st.session_state: st.session_state['last_file_id'] = None
 
-# --- 関数: シンプルなPDF画像化 ---
+# --- 関数: PDF画像化 ---
 def pdf_to_all_images(file_bytes):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     images = []
@@ -83,21 +83,35 @@ def pdf_to_all_images(file_bytes):
         images.append(Image.open(io.BytesIO(img_data)))
     return images
 
-# --- 関数: JSON抽出 ---
+# --- 関数: JSON抽出 (強化版) ---
 def extract_json(text):
+    """
+    AIの回答からJSONブロックを抽出する。
+    JSONDecodeErrorが起きないよう、正規表現で範囲を特定する。
+    """
     try:
+        # まずは単純にパースを試みる
         return json.loads(text)
     except:
         pass
+    
     try:
-        s = text.find('{')
-        e = text.rfind('}') + 1
-        return json.loads(text[s:e])
+        # コードブロック ```json ... ``` を探す
+        match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
+        if match:
+            return json.loads(match.group(1))
+        
+        # 単純な { ... } を探す (最初と最後)
+        start = text.find('{')
+        end = text.rfind('}') + 1
+        if start != -1 and end != -1:
+            return json.loads(text[start:end])
     except:
-        return None
+        pass
+    return None
 
 # --- 関数: データ整形 & 強制フィルタリング ---
-def clean_data_items(items):
+def clean_and_normalize_data(items):
     cleaned_list = []
     # 除外キーワード
     exclude_keywords = [
@@ -107,9 +121,10 @@ def clean_data_items(items):
     ]
 
     for item in items:
+        # 初期値で埋める
         new_row = {"日付": "", "燃料名": "", "使用量": 0, "請求額": 0}
         
-        # 1. 列のマッピング
+        # 列のマッピング
         for k, v in item.items():
             key_str = str(k)
             val_str = str(v)
@@ -118,14 +133,14 @@ def clean_data_items(items):
             elif any(x in key_str for x in ["燃料", "品名", "商品", "name"]):
                 new_row["燃料名"] = val_str
             elif any(x in key_str for x in ["使用量", "数量", "L", "amount"]):
-                try: new_row["使用量"] = float(val_str.replace(",", ""))
+                try: new_row["使用量"] = float(str(val_str).replace(",", ""))
                 except: new_row["使用量"] = 0
             elif any(x in key_str for x in ["請求額", "金額", "price", "円"]):
-                try: new_row["請求額"] = float(val_str.replace(",", ""))
+                try: new_row["請求額"] = float(str(val_str).replace(",", ""))
                 except: new_row["請求額"] = 0
         
-        # 2. 強制フィルタリング
-        fuel_name = new_row["燃料名"]
+        # フィルタリング
+        fuel_name = str(new_row["燃料名"])
         is_gasoline = "ガソリン" in fuel_name
         should_exclude = False
         for kw in exclude_keywords:
@@ -145,7 +160,7 @@ if uploaded_file:
     file_id = uploaded_file.name + str(uploaded_file.size)
     if st.session_state['last_file_id'] != file_id:
         st.session_state['last_file_id'] = file_id
-        st.session_state['df'] = pd.DataFrame()
+        st.session_state['df'] = pd.DataFrame() # リセット
         if 'tax_type' in st.session_state: del st.session_state['tax_type']
         st.session_state['zoom_level'] = 100
         st.session_state['rotation'] = 0
@@ -161,9 +176,9 @@ if uploaded_file and api_key and selected_model_name:
 
     col1, col2 = st.columns([2, 1])
 
-    # --- 左: ビューア (手書き機能付き) ---
+    # --- 左: ビューア (安全装置付きCanvas) ---
     with col1:
-        # コントロールバー
+        # コントロール
         c1, c2, c3, c4, c5, c_toggle = st.columns([1, 1, 1, 1, 1, 3])
         with c1: st.button("➕", on_click=lambda: st.session_state.update({'zoom_level': st.session_state['zoom_level']+25}))
         with c2: st.button("➖", on_click=lambda: st.session_state.update({'zoom_level': max(10, st.session_state['zoom_level']-25)}))
@@ -171,17 +186,16 @@ if uploaded_file and api_key and selected_model_name:
         with c4: st.button("⤴", on_click=lambda: st.session_state.update({'rotation': (st.session_state['rotation']+90)%360}))
         with c5: st.button("R", on_click=lambda: st.session_state.update({'zoom_level': 100, 'rotation': 0}))
         
-        # 手書きモード切り替え
         use_canvas = False
         if HAS_CANVAS:
             with c_toggle:
                 use_canvas = st.toggle("✏️ 手書きモード", value=False)
         else:
             with c_toggle:
-                st.caption("※描画ライブラリ未検出")
+                st.caption("※描画機能なし")
 
         # ペン設定
-        stroke_color = "rgba(255, 255, 0, 0.4)" # 黄色マーカー
+        stroke_color = "rgba(255, 255, 0, 0.4)"
         stroke_width = 20
         if use_canvas:
             pen_col1, pen_col2 = st.columns(2)
@@ -190,9 +204,7 @@ if uploaded_file and api_key and selected_model_name:
                 if pen_type == "赤ペン":
                     stroke_color = "rgba(255, 0, 0, 0.8)"
                     stroke_width = 3
-            st.info("マウスで画像に直接書き込みができます。")
 
-        # 画像表示
         with st.container(height=850):
             current_zoom = st.session_state['zoom_level']
             current_rot = st.session_state['rotation']
@@ -204,29 +216,32 @@ if uploaded_file and api_key and selected_model_name:
                 if current_rot != 0:
                     img = img.rotate(current_rot, expand=True)
                 
-                # アスペクト比計算
-                aspect_ratio = img.height / img.width
-                display_height = int(display_width * aspect_ratio)
-                
+                # Canvas表示 (エラーが出たら通常表示にフォールバック)
                 if use_canvas:
-                    # キャンバス用にリサイズ
-                    resized_img = img.resize((display_width, display_height))
-                    # ★修正点: PIL画像をNumpy配列に変換 (これでAttributeErrorを防ぐ)
-                    bg_image_array = np.array(resized_img)
-                    
-                    canvas_key = f"canvas_{file_id}_{i}_{current_zoom}_{current_rot}"
-                    
-                    st_canvas(
-                        fill_color="rgba(0, 0, 0, 0)",
-                        stroke_width=stroke_width,
-                        stroke_color=stroke_color,
-                        background_image=bg_image_array, # 配列を渡す
-                        update_streamlit=True,
-                        height=display_height,
-                        width=display_width,
-                        drawing_mode="freedraw",
-                        key=canvas_key,
-                    )
+                    try:
+                        aspect_ratio = img.height / img.width
+                        display_height = int(display_width * aspect_ratio)
+                        resized_img = img.resize((display_width, display_height))
+                        
+                        canvas_key = f"cv_{file_id}_{i}_{current_zoom}_{current_rot}"
+                        
+                        st_canvas(
+                            fill_color="rgba(0, 0, 0, 0)",
+                            stroke_width=stroke_width,
+                            stroke_color=stroke_color,
+                            background_image=resized_img, # PIL画像をそのまま渡す(Numpyはダメ)
+                            update_streamlit=True,
+                            height=display_height,
+                            width=display_width,
+                            drawing_mode="freedraw",
+                            key=canvas_key,
+                        )
+                    except Exception as e:
+                        # もしCanvasでエラーが出たら警告を出して通常画像を表示
+                        st.warning("⚠️ お使いの環境では手書き機能が利用できません。通常表示に切り替えます。")
+                        st.image(img, width=display_width)
+                        # エラー詳細（デバッグ用）
+                        # st.caption(f"Error: {e}") 
                 else:
                     st.image(img, width=display_width)
 
@@ -256,44 +271,50 @@ if uploaded_file and api_key and selected_model_name:
                 """
                 
                 with st.spinner("解析中..."):
-                    res = model.generate_content([prompt] + processed_inputs)
+                    # 暴走防止のため max_output_tokens を設定
+                    res = model.generate_content(
+                        [prompt] + processed_inputs,
+                        generation_config=genai.types.GenerationConfig(max_output_tokens=4000)
+                    )
                     full_data = extract_json(res.text)
                     
-                    # データを初期化 (KeyError防止のため空でも定義する)
                     if full_data:
-                        cleaned_items = clean_data_items(full_data.get("items", []))
+                        raw_items = full_data.get("items", [])
+                        cleaned_items = clean_and_normalize_data(raw_items)
                         df = pd.DataFrame(cleaned_items)
                     else:
-                        df = pd.DataFrame()
-                        
-                    # 必須カラムの保証
+                        df = pd.DataFrame() # 空でも作成
+
+                    # --- 重要: KeyError防止のための列保証 ---
                     required_columns = ["日付", "燃料名", "使用量", "請求額"]
                     if df.empty:
                         df = pd.DataFrame(columns=required_columns)
                     else:
-                        # 存在しないカラムがあれば0埋めして追加
+                        # 足りない列があれば 0 や空文字で埋める
                         for col in required_columns:
                             if col not in df.columns:
-                                df[col] = 0
+                                df[col] = 0 if col in ["使用量", "請求額"] else ""
+                        # 余計な列は捨てる
                         df = df[required_columns]
-                    
+
                     df.reset_index(drop=True, inplace=True)
-                    
-                    # セッションに保存
                     st.session_state['df'] = df
                     st.session_state['tax_type'] = full_data.get("tax_type", "不明") if full_data else "不明"
                     st.toast("完了", icon="✅")
 
             except Exception as e:
-                st.error(f"エラー: {e}")
+                st.error(f"エラーが発生しました: {e}")
 
-        # --- 表の表示 ---
+        # --- 表の表示処理 ---
         if 'df' in st.session_state:
             df = st.session_state['df']
             
-            # データフレームが空でないか、カラムが存在するか確認
-            if not df.empty and "使用量" in df.columns:
-                # 型変換 (安全に)
+            # DataFrameが壊れていないか最終チェック
+            required_cols = ["使用量", "請求額", "燃料名", "日付"]
+            is_valid_df = not df.empty and all(c in df.columns for c in required_cols)
+
+            if is_valid_df:
+                # 安全に型変換
                 df["使用量"] = pd.to_numeric(df["使用量"], errors='coerce').fillna(0)
                 df["請求額"] = pd.to_numeric(df["請求額"], errors='coerce').fillna(0)
                 df["日付"] = df["日付"].astype(str).replace("nan", "")
@@ -301,7 +322,7 @@ if uploaded_file and api_key and selected_model_name:
 
                 st.markdown(f"**💰 消費税:** `{st.session_state.get('tax_type', '不明')}`")
                 
-                # --- 1. 合計表 ---
+                # 1. 集計表
                 st.markdown("##### 📈 集計テーブル")
                 summary_df = df.groupby("燃料名")[["使用量", "請求額"]].sum().reset_index()
                 total_usage = summary_df["使用量"].sum()
@@ -324,24 +345,21 @@ if uploaded_file and api_key and selected_model_name:
                 )
                 
                 st.markdown("---")
-                st.markdown("##### 📝 詳細データ (編集・フィルタ可能)")
+                st.markdown("##### 📝 詳細データ")
 
-                # --- 2. フィルタ ---
+                # 2. フィルタ
                 unique_fuels = df["燃料名"].unique().tolist()
                 selected_fuels = st.multiselect("🔍 燃料名でフィルタ", unique_fuels, default=unique_fuels)
                 
-                if not selected_fuels:
-                    view_df = df
-                else:
-                    view_df = df[df["燃料名"].isin(selected_fuels)]
+                view_df = df if not selected_fuels else df[df["燃料名"].isin(selected_fuels)]
 
-                # --- 3. 詳細エディタ ---
+                # 3. エディタ
                 edited_df = st.data_editor(
                     view_df,
                     num_rows="dynamic", 
                     use_container_width=True,
                     hide_index=True,
-                    key="editor_canvas_fix_v2", 
+                    key="editor_safe_v1", 
                     column_config={
                         "日付": st.column_config.TextColumn("日付"),
                         "燃料名": st.column_config.TextColumn("燃料名"),
@@ -350,18 +368,21 @@ if uploaded_file and api_key and selected_model_name:
                     }
                 )
                 
-                # --- 4. 同期処理 ---
+                # 4. 同期
                 if not edited_df.equals(view_df):
                     new_main_df = st.session_state['df'].copy()
                     
+                    # 削除
                     deleted_indices = set(view_df.index) - set(edited_df.index)
                     if deleted_indices:
                         new_main_df = new_main_df.drop(list(deleted_indices))
                     
+                    # 更新
                     common_indices = list(set(edited_df.index) & set(new_main_df.index))
                     if common_indices:
                         new_main_df.update(edited_df.loc[common_indices])
                     
+                    # 追加
                     new_rows = edited_df[~edited_df.index.isin(view_df.index)]
                     if not new_rows.empty:
                         new_main_df = pd.concat([new_main_df, new_rows], ignore_index=True)
