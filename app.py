@@ -8,7 +8,7 @@ import fitz  # PyMuPDF
 import re
 
 # --- ページ設定 ---
-st.set_page_config(layout="wide", page_title="燃料明細OCR (Limiter)")
+st.set_page_config(layout="wide", page_title="燃料明細OCR (Safe)")
 st.title("⛽ 燃料明細 自動抽出ツール")
 st.caption(f"System Version: {st.__version__}")
 
@@ -67,17 +67,13 @@ def get_pdf_images(file_bytes, texts_to_highlight=None):
         images.append(Image.open(io.BytesIO(img_data)))
     return images
 
-# --- 関数: JSON抽出 (修復機能付き) ---
+# --- 関数: JSON抽出 ---
 def extract_json(text):
-    """AIの回答からJSON部分を抜き出し、壊れていれば修復を試みる"""
     try:
-        # 1. 素直にパースできるか
         return json.loads(text)
     except:
         pass
-
     try:
-        # 2. { ... } の範囲を探す
         start = text.find('{')
         end = text.rfind('}') + 1
         if start != -1 and end != -1:
@@ -85,7 +81,6 @@ def extract_json(text):
             return json.loads(json_str)
     except:
         pass
-    
     return None
 
 # --- メイン処理 ---
@@ -153,24 +148,37 @@ if uploaded_file and api_key and selected_model_name:
                 """
                 
                 with st.spinner("解析中..."):
-                    # generation_config で暴走を止める (最大2000トークン)
                     res = model.generate_content(
                         [prompt] + inputs,
                         generation_config=genai.types.GenerationConfig(max_output_tokens=2000)
                     )
-                    
                     data = extract_json(res.text)
                     
                     if data:
-                        st.session_state['df'] = pd.DataFrame(data.get("items", []))
+                        # --- ここでKeyError対策を実施 ---
+                        df_new = pd.DataFrame(data.get("items", []))
+                        
+                        # 必須カラムを定義
+                        required_cols = ["日付", "燃料名", "使用量", "請求額"]
+                        
+                        # データが空の場合でもカラムだけは作る
+                        if df_new.empty:
+                            df_new = pd.DataFrame(columns=required_cols)
+                        
+                        # 不足しているカラムがあれば初期値で埋める
+                        for col in required_cols:
+                            if col not in df_new.columns:
+                                if col in ["使用量", "請求額"]:
+                                    df_new[col] = 0
+                                else:
+                                    df_new[col] = ""
+                                    
+                        st.session_state['df'] = df_new
                         st.session_state['tax_type'] = data.get("tax", "不明")
                         st.session_state['highlight_text'] = []
                         st.toast("完了", icon="✅")
                     else:
-                        st.error("AIの回答が解析できませんでした（暴走の可能性があります）。")
-                        # デバッグ用に最初の500文字だけ表示
-                        with st.expander("回答の一部を確認"):
-                            st.text(res.text[:500] + "...")
+                        st.error("解析失敗: AIの応答形式が不正です。再試行してください。")
 
             except Exception as e:
                 st.error(f"エラー: {e}")
@@ -178,6 +186,8 @@ if uploaded_file and api_key and selected_model_name:
         if not st.session_state['df'].empty:
             df = st.session_state['df']
             df.reset_index(drop=True, inplace=True)
+            
+            # 安全に数値変換（カラムが存在することが保証されているためエラーにならない）
             df["使用量"] = pd.to_numeric(df["使用量"], errors='coerce').fillna(0)
             df["請求額"] = pd.to_numeric(df["請求額"], errors='coerce').fillna(0)
 
@@ -206,7 +216,7 @@ if uploaded_file and api_key and selected_model_name:
                 df,
                 use_container_width=True,
                 hide_index=True,
-                key="editor_limit",
+                key="editor_safe",
                 selection_mode="single-row",
                 column_config={
                     "日付": st.column_config.TextColumn(),
@@ -216,8 +226,8 @@ if uploaded_file and api_key and selected_model_name:
                 }
             )
             
-            if "editor_limit" in st.session_state and st.session_state.editor_limit.get("selection"):
-                selection = st.session_state.editor_limit["selection"]
+            if "editor_safe" in st.session_state and st.session_state.editor_safe.get("selection"):
+                selection = st.session_state.editor_safe["selection"]
                 if selection.get("rows"):
                     row_idx = selection["rows"][0]
                     if row_idx < len(edited_df):
