@@ -5,259 +5,146 @@ import pandas as pd
 import json
 import io
 import fitz  # PyMuPDF
-import re
+import os
 
 # --- ページ設定 ---
-st.set_page_config(layout="wide", page_title="燃料明細OCR (Final)")
+st.set_page_config(layout="wide", page_title="燃料明細OCR (共有版)")
 st.title("⛽ 燃料明細 自動抽出ツール")
-st.caption(f"System Version: {st.__version__}")
 
-# --- CSS ---
-st.markdown("""
-    <style>
-    .stButton button { font-weight: bold; }
-    div[data-testid="stMetricValue"] { font-size: 1.2rem; }
-    </style>
-""", unsafe_allow_html=True)
-
-# --- 1. APIキー ---
+# --- 1. APIキー設定 (Secrets対応版) ---
 api_key = None
+
+# A. Streamlit Cloudの「Secrets」にキーが設定されている場合
 if "GEMINI_API_KEY" in st.secrets:
     api_key = st.secrets["GEMINI_API_KEY"]
-    st.sidebar.success("✅ 認証済み")
+    st.sidebar.success("✅ 認証済み (共有キーを使用)")
+# B. 設定がない場合 (ローカルテスト用など)
 else:
     api_key_input = st.sidebar.text_input("Gemini API Key", type="password")
     api_key = api_key_input.strip() if api_key_input else None
 
-# --- 2. モデル ---
+# --- 2. モデルの動的取得 ---
 available_model_names = []
 if api_key:
     genai.configure(api_key=api_key, transport='rest')
     try:
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                available_model_names.append(m.name)
-    except: pass
+        with st.spinner("利用可能なモデルを問い合わせ中..."):
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    available_model_names.append(m.name)
+        if not available_model_names:
+            st.sidebar.error("❌ 利用可能なモデルが見つかりませんでした。")
+    except Exception as e:
+        st.sidebar.error(f"モデル一覧の取得に失敗: {e}")
 
+# モデル選択 (リストがある場合のみ表示)
 selected_model_name = None
 if available_model_names:
-    selected_model_name = st.sidebar.selectbox("使用モデル", available_model_names, index=0)
+    selected_model_name = st.sidebar.selectbox(
+        "使用するモデル", 
+        available_model_names
+    )
 
-# --- 3. セッション初期化 ---
-if 'zoom_level' not in st.session_state: st.session_state['zoom_level'] = 100
-if 'rotation' not in st.session_state: st.session_state['rotation'] = 0
-if 'df' not in st.session_state: st.session_state['df'] = pd.DataFrame()
-if 'highlight_text' not in st.session_state: st.session_state['highlight_text'] = []
-if 'last_file_id' not in st.session_state: st.session_state['last_file_id'] = None
+# --- 3. ファイルアップロード ---
+uploaded_file = st.file_uploader("請求書(PDF/画像)をアップロード", type=["pdf", "png", "jpg", "jpeg"])
 
-# --- 関数: PDF画像化 ---
-def get_pdf_images(file_bytes, texts_to_highlight=None):
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    images = []
-    for page in doc:
-        if texts_to_highlight:
-            for text in texts_to_highlight:
-                if text and len(str(text)) > 0:
-                    quads = page.search_for(str(text))
-                    for quad in quads:
-                        page.draw_rect(quad, color=(1, 0, 0), width=0, fill=(1, 0, 0), fill_opacity=0.3)
-                        page.draw_rect(quad, color=(1, 0, 0), width=1.5)
-        pix = page.get_pixmap(dpi=150)
-        img_data = pix.tobytes("png")
-        images.append(Image.open(io.BytesIO(img_data)))
-    return images
-
-# --- 関数: JSON抽出 ---
-def extract_json(text):
-    try:
-        return json.loads(text)
-    except:
-        pass
-    try:
-        start = text.find('{')
-        end = text.rfind('}') + 1
-        if start != -1 and end != -1:
-            json_str = text[start:end]
-            return json.loads(json_str)
-    except:
-        pass
-    return None
+def pdf_page_to_image(pdf_file):
+    doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
+    page = doc.load_page(0)
+    pix = page.get_pixmap()
+    img_data = pix.tobytes("png")
+    return Image.open(io.BytesIO(img_data))
 
 # --- メイン処理 ---
-uploaded_file = st.file_uploader("請求書(PDF/画像)をアップロード", type=["pdf", "png", "jpg"])
-
-if uploaded_file:
-    file_id = uploaded_file.name + str(uploaded_file.size)
-    if st.session_state['last_file_id'] != file_id:
-        st.session_state['last_file_id'] = file_id
-        st.session_state['df'] = pd.DataFrame()
-        st.session_state['highlight_text'] = []
-        st.session_state['tax_type'] = "ー"
-        st.session_state['zoom_level'] = 100
-        st.session_state['rotation'] = 0
-
 if uploaded_file and api_key and selected_model_name:
-    file_bytes = uploaded_file.read()
+    if uploaded_file.type == "application/pdf":
+        image = pdf_page_to_image(uploaded_file)
+    else:
+        image = Image.open(uploaded_file)
+
     col1, col2 = st.columns([1.5, 1])
 
     with col1:
-        c1, c2, c3, c4, c5, _ = st.columns([1,1,1,1,1,5])
-        with c1: st.button("➕", on_click=lambda: st.session_state.update({'zoom_level': st.session_state['zoom_level']+25}), help="拡大")
-        with c2: st.button("➖", on_click=lambda: st.session_state.update({'zoom_level': max(10, st.session_state['zoom_level']-25)}), help="縮小")
-        with c3: st.button("⤵", on_click=lambda: st.session_state.update({'rotation': (st.session_state['rotation']-90)%360}), help="右回転")
-        with c4: st.button("⤴", on_click=lambda: st.session_state.update({'rotation': (st.session_state['rotation']+90)%360}), help="左回転")
-        with c5: st.button("R", on_click=lambda: st.session_state.update({'zoom_level': 100, 'rotation': 0}), help="リセット")
-
-        display_images = []
-        if uploaded_file.type == "application/pdf":
-            display_images = get_pdf_images(file_bytes, st.session_state['highlight_text'])
-        else:
-            img = Image.open(io.BytesIO(file_bytes))
-            display_images = [img]
-
-        with st.container(height=800):
-            current_width = int(800 * (st.session_state['zoom_level'] / 100))
-            for img in display_images:
-                if st.session_state['rotation']:
-                    img = img.rotate(st.session_state['rotation'], expand=True)
-                st.image(img, width=current_width)
+        st.subheader("📄 原本")
+        st.image(image, use_container_width=True)
 
     with col2:
-        if st.button("🚀 抽出実行", type="primary", use_container_width=True):
+        st.subheader("📊 抽出結果")
+        
+        if st.button("抽出を開始する", type="primary"):
+            st.info(f"使用モデル: {selected_model_name}")
+            
             try:
                 model = genai.GenerativeModel(selected_model_name)
-                inputs = []
-                if uploaded_file.type == "application/pdf":
-                    raw_images = get_pdf_images(file_bytes, None)
-                else:
-                    raw_images = [Image.open(io.BytesIO(file_bytes))]
-                for img in raw_images:
-                     if st.session_state['rotation']:
-                        img = img.rotate(st.session_state['rotation'], expand=True)
-                     inputs.append(img)
-
+                
                 prompt = """
-                請求書画像を解析し、以下の情報をJSON形式のみで出力してください。Markdown不要。
-                
-                1. **items**: 以下のリスト
-                   - 日付 (MM-DD)
-                   - 燃料名 (ガソリン, 軽油, 灯油, 重油, 軽油税などCO2排出対象のみ。洗車等は除外)
-                   - 使用量 (L) 数値
-                   - 請求額 (円) 数値
-                2. **tax**: "税込" or "税抜"
+                このガソリンスタンドの請求書画像を解析してください。
+                以下の3つの情報を抽出し、必ず指定のJSON形式で出力してください。
+                Markdownコードブロックは不要です。生JSONのみ返してください。
+
+                1. **明細リスト**: 日付、燃料名、使用量(L)、請求額(円)
+                   - 「軽油税」が個別の行として記載されている場合は、それも明細行として抽出すること。
+                   - 明細以外の「合計」行は除外すること。
+                2. **税区分**: 書類全体を見て、金額が「税込」か「税抜」か判定すること。
+                3. **メタ情報**: その他気づいたことがあれば記述。
+
+                出力JSONフォーマット:
+                {
+                    "tax_type": "税込" または "税抜",
+                    "items": [
+                        {
+                            "日付": "MM-DD",
+                            "燃料名": "レギュラー、軽油、軽油税など",
+                            "使用量": 数値(数値がない場合は 0),
+                            "請求額": 数値
+                        }
+                    ]
+                }
+                数値にはカンマや円マークを入れないでください。
                 """
-                
+
                 with st.spinner("解析中..."):
-                    res = model.generate_content(
-                        [prompt] + inputs,
-                        generation_config=genai.types.GenerationConfig(max_output_tokens=2000)
-                    )
-                    data = extract_json(res.text)
-                    
-                    if data:
-                        # --- 強制データチェック（KeyError防止） ---
-                        df_new = pd.DataFrame(data.get("items", []))
-                        
-                        # 必要なカラムがなければ強制的に作る
-                        required_cols = ["日付", "燃料名", "使用量", "請求額"]
-                        if df_new.empty:
-                            df_new = pd.DataFrame(columns=required_cols)
-                        
-                        for col in required_cols:
-                            if col not in df_new.columns:
-                                df_new[col] = 0 if col in ["使用量", "請求額"] else ""
-                                    
-                        st.session_state['df'] = df_new
-                        st.session_state['tax_type'] = data.get("tax", "不明")
-                        st.session_state['highlight_text'] = []
-                        st.toast("完了", icon="✅")
-                    else:
-                        st.error("解析失敗: データ形式が読み取れませんでした。")
+                    response = model.generate_content([prompt, image])
+                
+                json_text = response.text.replace("```json", "").replace("```", "").strip()
+                if json_text.startswith("JSON"): json_text = json_text[4:]
+                
+                full_data = json.loads(json_text)
+                df = pd.DataFrame(full_data["items"])
+                
+                st.session_state['df'] = df
+                st.session_state['tax_type'] = full_data.get("tax_type", "不明")
+                st.success("成功しました！")
 
             except Exception as e:
-                st.error(f"エラー: {e}")
+                st.error(f"エラーが発生しました: {e}")
 
-        if not st.session_state['df'].empty:
+        if 'df' in st.session_state:
             df = st.session_state['df']
-            df.reset_index(drop=True, inplace=True)
-            
-            # 数値変換（エラーが出ないように安全に）
+            tax_type = st.session_state.get('tax_type', '不明')
+
             df["使用量"] = pd.to_numeric(df["使用量"], errors='coerce').fillna(0)
             df["請求額"] = pd.to_numeric(df["請求額"], errors='coerce').fillna(0)
+
+            st.markdown(f"**💰 消費税区分:** `{tax_type}`")
+            st.markdown("##### ⛽ 燃料別合計")
             
-            # 文字列型に統一（表示用）
-            df["日付"] = df["日付"].astype(str)
-            df["燃料名"] = df["燃料名"].astype(str)
+            grouped = df.groupby("燃料名")[["使用量", "請求額"]].sum().reset_index()
+            for index, row in grouped.iterrows():
+                usage_str = f"{row['使用量']:.2f} L" if row['使用量'] > 0 else "-"
+                st.info(f"**{row['燃料名']}**: {usage_str} / ¥{row['請求額']:,.0f}")
 
-            st.markdown(f"**💰 消費税:** `{st.session_state.get('tax_type')}`")
+            st.markdown("---")
 
-            summary_df = df.groupby("燃料名")[["使用量", "請求額"]].sum().reset_index()
-            total_row = pd.DataFrame({
-                "燃料名": ["🔴 合計"],
-                "使用量": [summary_df["使用量"].sum()],
-                "請求額": [summary_df["請求額"].sum()]
-            })
-            st.dataframe(
-                pd.concat([summary_df, total_row], ignore_index=True),
-                hide_index=True,
+            edited_df = st.data_editor(
+                df,
+                num_rows="dynamic",
                 use_container_width=True,
                 column_config={
                     "請求額": st.column_config.NumberColumn(format="¥%d"),
                     "使用量": st.column_config.NumberColumn(format="%.2f L"),
                 }
             )
-
-            st.markdown("---")
-            st.markdown("##### 📝 詳細データ")
-
-            # --- ここが修正ポイント ---
-            # 1. keyを "editor_v2026" に変更（キャッシュをクリアしてTypeErrorを解消）
-            # 2. try-except で囲む（万が一エラーになってもアプリを落とさない）
-            try:
-                edited_df = st.data_editor(
-                    df,
-                    use_container_width=True,
-                    hide_index=True,
-                    key="editor_v2026",  # ← 新しい名前に変更！
-                    selection_mode="single-row",
-                    column_config={
-                        "日付": st.column_config.TextColumn(),
-                        "燃料名": st.column_config.TextColumn(),
-                        "請求額": st.column_config.NumberColumn(format="¥%d"),
-                        "使用量": st.column_config.NumberColumn(format="%.2f L"),
-                    }
-                )
-
-                # ハイライト機能
-                if "editor_v2026" in st.session_state and st.session_state.editor_v2026.get("selection"):
-                    selection = st.session_state.editor_v2026["selection"]
-                    if selection.get("rows"):
-                        row_idx = selection["rows"][0]
-                        if row_idx < len(edited_df):
-                            selected_row = edited_df.iloc[row_idx]
-                            targets = [
-                                str(selected_row["日付"]),
-                                str(int(selected_row["請求額"])), 
-                                str(selected_row["燃料名"])
-                            ]
-                            if st.session_state['highlight_text'] != targets:
-                                st.session_state['highlight_text'] = targets
-                                st.rerun()
-                else:
-                    if st.session_state['highlight_text']:
-                        st.session_state['highlight_text'] = []
-                        st.rerun()
-
-                if not edited_df.equals(st.session_state['df']):
-                    st.session_state['df'] = edited_df
-                    st.rerun() 
-                
-                # CSVダウンロード
-                csv = edited_df.to_csv(index=False).encode('utf-8-sig')
-                st.download_button("CSVダウンロード", csv, "fuel_data.csv", "text/csv", use_container_width=True)
-
-            except Exception as e:
-                # もしエディタが壊れても、最低限の表だけは表示する（安全策）
-                st.error("⚠️ エディタの表示に失敗しましたが、データは安全です。")
-                st.dataframe(df)
-                st.caption(f"Error details: {e}")
+            
+            csv = edited_df.to_csv(index=False).encode('utf-8-sig')
+            st.download_button("CSVダウンロード", csv, "fuel_data.csv", "text/csv")
