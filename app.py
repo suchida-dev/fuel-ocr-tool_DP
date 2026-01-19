@@ -15,7 +15,7 @@ except ImportError:
     HAS_CANVAS = False
 
 # --- ページ設定 ---
-st.set_page_config(layout="wide", page_title="燃料明細OCR (Final Safe)")
+st.set_page_config(layout="wide", page_title="燃料明細OCR (Stable)")
 st.title("⛽ 燃料明細 自動抽出ツール")
 
 # --- CSS: デザイン調整 ---
@@ -53,13 +53,16 @@ if api_key:
 selected_model_name = None
 if available_model_names:
     default_index = 0
+    # 安定版のモデルを優先的に探す
     for i, name in enumerate(available_model_names):
         if "gemini-3-flash" in name:
             default_index = i
             break
         elif "gemini-2.5-flash-preview" in name:
             default_index = i
-    
+        elif "gemini-1.5-flash" in name and "exp" not in name:
+            default_index = i
+            
     selected_model_name = st.sidebar.selectbox(
         "使用するモデル", 
         available_model_names, 
@@ -71,6 +74,7 @@ if 'zoom_level' not in st.session_state: st.session_state['zoom_level'] = 100
 if 'rotation' not in st.session_state: st.session_state['rotation'] = 0
 if 'df' not in st.session_state: st.session_state['df'] = pd.DataFrame()
 if 'last_file_id' not in st.session_state: st.session_state['last_file_id'] = None
+if 'canvas_error_shown' not in st.session_state: st.session_state['canvas_error_shown'] = False
 
 # --- 関数: PDF画像化 ---
 def pdf_to_all_images(file_bytes):
@@ -148,6 +152,7 @@ if uploaded_file:
         if 'tax_type' in st.session_state: del st.session_state['tax_type']
         st.session_state['zoom_level'] = 100
         st.session_state['rotation'] = 0
+        st.session_state['canvas_error_shown'] = False # ファイルが変わったらエラーフラグもリセット
 
 if uploaded_file and api_key and selected_model_name:
     file_bytes = uploaded_file.read()
@@ -160,7 +165,7 @@ if uploaded_file and api_key and selected_model_name:
 
     col1, col2 = st.columns([2, 1])
 
-    # --- 左: ビューア (安全対策済みCanvas) ---
+    # --- 左: ビューア ---
     with col1:
         c1, c2, c3, c4, c5, c_toggle = st.columns([1, 1, 1, 1, 1, 3])
         with c1: st.button("➕", on_click=lambda: st.session_state.update({'zoom_level': st.session_state['zoom_level']+25}))
@@ -170,13 +175,13 @@ if uploaded_file and api_key and selected_model_name:
         with c5: st.button("R", on_click=lambda: st.session_state.update({'zoom_level': 100, 'rotation': 0}))
         
         use_canvas = False
-        if HAS_CANVAS:
+        if HAS_CANVAS and not st.session_state['canvas_error_shown']:
             with c_toggle:
-                # デフォルトはFalseにして、手書きしたい時だけONにする設計
                 use_canvas = st.toggle("✏️ 手書きモード", value=False)
         else:
             with c_toggle:
-                st.caption("※描画機能なし")
+                # エラーが出たことがある、またはライブラリがない場合は表示しない
+                st.caption("※手書き機能OFF")
 
         stroke_color = "rgba(255, 255, 0, 0.4)"
         stroke_width = 20
@@ -198,31 +203,40 @@ if uploaded_file and api_key and selected_model_name:
                 if current_rot != 0:
                     img = img.rotate(current_rot, expand=True)
                 
-                # Canvas表示処理 (エラーが出たら即座に通常表示へ)
+                # Canvas表示処理 (超強力なエラーハンドリング)
                 show_normal_image = True
+                
                 if use_canvas:
                     try:
+                        # 画像のリサイズと準備
                         aspect_ratio = img.height / img.width
                         display_height = int(display_width * aspect_ratio)
                         resized_img = img.resize((display_width, display_height))
                         
                         canvas_key = f"cv_{file_id}_{i}_{current_zoom}_{current_rot}"
                         
+                        # ここでCanvasを描画
                         st_canvas(
                             fill_color="rgba(0, 0, 0, 0)",
                             stroke_width=stroke_width,
                             stroke_color=stroke_color,
-                            background_image=resized_img,
+                            background_image=resized_img, 
                             update_streamlit=True,
                             height=display_height,
                             width=display_width,
                             drawing_mode="freedraw",
                             key=canvas_key,
                         )
-                        show_normal_image = False
-                    except Exception:
-                        # エラー発生時はここに来る
-                        st.caption("⚠️ 手書き機能が利用できません（バージョン非互換の可能性があります）")
+                        show_normal_image = False # 成功したら通常画像は出さない
+                        
+                    except Exception as e:
+                        # Canvasで何らかのエラーが出たらここに来る
+                        # ユーザーには1回だけ警告を出し、以降はCanvasを無効化する
+                        if not st.session_state['canvas_error_shown']:
+                            st.warning("⚠️ 手書き機能が環境と互換性がないため、通常表示に切り替えます。")
+                            st.session_state['canvas_error_shown'] = True
+                            st.rerun() # 再読み込みしてUIを更新
+                        
                         show_normal_image = True
                 
                 if show_normal_image:
@@ -267,17 +281,18 @@ if uploaded_file and api_key and selected_model_name:
                     else:
                         df = pd.DataFrame()
 
-                    # --- ★ KeyError完全防止: 列の強制確保 ---
-                    # データが空でも、変な列名でも、必ずこの4列を持つDataFrameに作り変える
+                    # --- ★ KeyError防止: ここで列を絶対に作る ---
                     required_columns = ["日付", "燃料名", "使用量", "請求額"]
                     
-                    # 1. 既存のdfに足りない列を追加
-                    for col in required_columns:
-                        if col not in df.columns:
-                            df[col] = 0 if col in ["使用量", "請求額"] else ""
-                    
-                    # 2. 必要な列だけを抽出（余計な列を捨てる）
-                    df = df[required_columns]
+                    # DataFrameが空、または列が足りない場合、強制的に列を作成
+                    if df.empty:
+                        df = pd.DataFrame(columns=required_columns)
+                    else:
+                        for col in required_columns:
+                            if col not in df.columns:
+                                df[col] = 0 if col in ["使用量", "請求額"] else ""
+                        # 余計な列は削除
+                        df = df[required_columns]
                     
                     df.reset_index(drop=True, inplace=True)
                     st.session_state['df'] = df
@@ -285,23 +300,23 @@ if uploaded_file and api_key and selected_model_name:
                     st.toast("完了", icon="✅")
 
             except Exception as e:
-                st.error(f"エラー: {e}")
+                st.error(f"エラーが発生しました: {e}")
 
         # --- 表の表示処理 ---
         if 'df' in st.session_state:
             df = st.session_state['df']
             
-            # DataFrameの最終チェック
+            # DataFrameの最終安全チェック
             if not df.empty:
-                # ここで再度カラムチェックを行う（念には念を）
-                if "使用量" not in df.columns: df["使用量"] = 0
-                if "請求額" not in df.columns: df["請求額"] = 0
-                
-                # 型変換
-                df["使用量"] = pd.to_numeric(df["使用量"], errors='coerce').fillna(0)
-                df["請求額"] = pd.to_numeric(df["請求額"], errors='coerce').fillna(0)
-                df["日付"] = df["日付"].astype(str).replace("nan", "")
-                df["燃料名"] = df["燃料名"].astype(str).replace("nan", "")
+                # 型変換 (KeyErrorが出ないように列の存在確認は済んでいる前提だが、念のため)
+                try:
+                    df["使用量"] = pd.to_numeric(df["使用量"], errors='coerce').fillna(0)
+                    df["請求額"] = pd.to_numeric(df["請求額"], errors='coerce').fillna(0)
+                    df["日付"] = df["日付"].astype(str).replace("nan", "")
+                    df["燃料名"] = df["燃料名"].astype(str).replace("nan", "")
+                except Exception:
+                    # 万が一ここでもエラーが出たら空にする（アプリは落とさない）
+                    df = pd.DataFrame(columns=["日付", "燃料名", "使用量", "請求額"])
 
                 st.markdown(f"**💰 消費税:** `{st.session_state.get('tax_type', '不明')}`")
                 
@@ -342,7 +357,7 @@ if uploaded_file and api_key and selected_model_name:
                     num_rows="dynamic", 
                     use_container_width=True,
                     hide_index=True,
-                    key="editor_final_safe", 
+                    key="editor_unbreakable", 
                     column_config={
                         "日付": st.column_config.TextColumn("日付"),
                         "燃料名": st.column_config.TextColumn("燃料名"),
