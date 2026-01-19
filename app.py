@@ -5,8 +5,9 @@ import pandas as pd
 import json
 import io
 import fitz  # PyMuPDF
+import numpy as np # 画像変換用にnumpyを追加
 
-# --- 追加ライブラリの読み込み (エラー回避付き) ---
+# --- 追加ライブラリの読み込み check ---
 try:
     from streamlit_drawable_canvas import st_canvas
     HAS_CANVAS = True
@@ -14,7 +15,7 @@ except ImportError:
     HAS_CANVAS = False
 
 # --- ページ設定 ---
-st.set_page_config(layout="wide", page_title="燃料明細OCR (Marker)")
+st.set_page_config(layout="wide", page_title="燃料明細OCR (Canvas Fix)")
 st.title("⛽ 燃料明細 自動抽出ツール")
 
 # --- CSS: デザイン調整 ---
@@ -179,8 +180,8 @@ if uploaded_file and api_key and selected_model_name:
             with c_toggle:
                 st.caption("※描画ライブラリ未検出")
 
-        # ペン設定（手書きモード時のみ表示）
-        stroke_color = "rgba(255, 255, 0, 0.4)" # デフォルト: 黄色マーカー
+        # ペン設定
+        stroke_color = "rgba(255, 255, 0, 0.4)" # 黄色マーカー
         stroke_width = 20
         if use_canvas:
             pen_col1, pen_col2 = st.columns(2)
@@ -196,35 +197,30 @@ if uploaded_file and api_key and selected_model_name:
             current_zoom = st.session_state['zoom_level']
             current_rot = st.session_state['rotation']
             
-            # ズーム倍率に応じたサイズ計算
-            # 基準幅を1000pxとし、倍率を掛ける
             base_width = 1000
             display_width = int(base_width * (current_zoom / 100))
             
             for i, img in enumerate(input_contents):
-                # 回転適用
                 if current_rot != 0:
                     img = img.rotate(current_rot, expand=True)
                 
-                # リサイズ（キャンバスのサイズ合わせのため）
-                # アスペクト比を維持して計算
+                # アスペクト比計算
                 aspect_ratio = img.height / img.width
                 display_height = int(display_width * aspect_ratio)
                 
                 if use_canvas:
-                    # キャンバス用に画像をリサイズ
+                    # キャンバス用にリサイズ
                     resized_img = img.resize((display_width, display_height))
+                    # ★修正点: PIL画像をNumpy配列に変換 (これでAttributeErrorを防ぐ)
+                    bg_image_array = np.array(resized_img)
                     
-                    # キャンバス表示
-                    # keyにfile_id, zoom, rotation, indexを含めることで、状態が変わるたびにリセットする
-                    # (そうしないとズームしたときに描画がずれるため)
                     canvas_key = f"canvas_{file_id}_{i}_{current_zoom}_{current_rot}"
                     
                     st_canvas(
-                        fill_color="rgba(0, 0, 0, 0)", # 塗りつぶしなし
+                        fill_color="rgba(0, 0, 0, 0)",
                         stroke_width=stroke_width,
                         stroke_color=stroke_color,
-                        background_image=resized_img,
+                        background_image=bg_image_array, # 配列を渡す
                         update_streamlit=True,
                         height=display_height,
                         width=display_width,
@@ -232,7 +228,6 @@ if uploaded_file and api_key and selected_model_name:
                         key=canvas_key,
                     )
                 else:
-                    # 通常表示 (高速)
                     st.image(img, width=display_width)
 
     # --- 右: 操作と表 ---
@@ -264,108 +259,115 @@ if uploaded_file and api_key and selected_model_name:
                     res = model.generate_content([prompt] + processed_inputs)
                     full_data = extract_json(res.text)
                     
+                    # データを初期化 (KeyError防止のため空でも定義する)
                     if full_data:
                         cleaned_items = clean_data_items(full_data.get("items", []))
                         df = pd.DataFrame(cleaned_items)
-                        
-                        required_columns = ["日付", "燃料名", "使用量", "請求額"]
-                        if df.empty:
-                            df = pd.DataFrame(columns=required_columns)
-                        else:
-                            df = df[required_columns]
-                        
-                        df.reset_index(drop=True, inplace=True)
-                        st.session_state['df'] = df
-                        st.session_state['tax_type'] = full_data.get("tax_type", "不明")
-                        st.toast("完了", icon="✅")
                     else:
-                        st.error("解析失敗")
+                        df = pd.DataFrame()
+                        
+                    # 必須カラムの保証
+                    required_columns = ["日付", "燃料名", "使用量", "請求額"]
+                    if df.empty:
+                        df = pd.DataFrame(columns=required_columns)
+                    else:
+                        # 存在しないカラムがあれば0埋めして追加
+                        for col in required_columns:
+                            if col not in df.columns:
+                                df[col] = 0
+                        df = df[required_columns]
+                    
+                    df.reset_index(drop=True, inplace=True)
+                    
+                    # セッションに保存
+                    st.session_state['df'] = df
+                    st.session_state['tax_type'] = full_data.get("tax_type", "不明") if full_data else "不明"
+                    st.toast("完了", icon="✅")
 
             except Exception as e:
                 st.error(f"エラー: {e}")
 
         # --- 表の表示 ---
-        if 'df' in st.session_state and not st.session_state['df'].empty:
+        if 'df' in st.session_state:
             df = st.session_state['df']
             
-            # 型変換
-            df["使用量"] = pd.to_numeric(df["使用量"], errors='coerce').fillna(0)
-            df["請求額"] = pd.to_numeric(df["請求額"], errors='coerce').fillna(0)
-            df["日付"] = df["日付"].astype(str).replace("nan", "")
-            df["燃料名"] = df["燃料名"].astype(str).replace("nan", "")
+            # データフレームが空でないか、カラムが存在するか確認
+            if not df.empty and "使用量" in df.columns:
+                # 型変換 (安全に)
+                df["使用量"] = pd.to_numeric(df["使用量"], errors='coerce').fillna(0)
+                df["請求額"] = pd.to_numeric(df["請求額"], errors='coerce').fillna(0)
+                df["日付"] = df["日付"].astype(str).replace("nan", "")
+                df["燃料名"] = df["燃料名"].astype(str).replace("nan", "")
 
-            st.markdown(f"**💰 消費税:** `{st.session_state.get('tax_type', '不明')}`")
-            
-            # --- 1. 合計表 ---
-            st.markdown("##### 📈 集計テーブル")
-            summary_df = df.groupby("燃料名")[["使用量", "請求額"]].sum().reset_index()
-            total_usage = summary_df["使用量"].sum()
-            total_cost = summary_df["請求額"].sum()
-            total_row = pd.DataFrame({
-                "燃料名": ["🔴 総合計"], 
-                "使用量": [total_usage], 
-                "請求額": [total_cost]
-            })
-            display_summary = pd.concat([summary_df, total_row], ignore_index=True)
-            
-            st.dataframe(
-                display_summary, 
-                use_container_width=True, 
-                hide_index=True,
-                column_config={
-                    "請求額": st.column_config.NumberColumn(format="¥%d"),
-                    "使用量": st.column_config.NumberColumn(format="%.2f L"),
-                }
-            )
-            
-            st.markdown("---")
-            st.markdown("##### 📝 詳細データ (編集・フィルタ可能)")
+                st.markdown(f"**💰 消費税:** `{st.session_state.get('tax_type', '不明')}`")
+                
+                # --- 1. 合計表 ---
+                st.markdown("##### 📈 集計テーブル")
+                summary_df = df.groupby("燃料名")[["使用量", "請求額"]].sum().reset_index()
+                total_usage = summary_df["使用量"].sum()
+                total_cost = summary_df["請求額"].sum()
+                total_row = pd.DataFrame({
+                    "燃料名": ["🔴 総合計"], 
+                    "使用量": [total_usage], 
+                    "請求額": [total_cost]
+                })
+                display_summary = pd.concat([summary_df, total_row], ignore_index=True)
+                
+                st.dataframe(
+                    display_summary, 
+                    use_container_width=True, 
+                    hide_index=True,
+                    column_config={
+                        "請求額": st.column_config.NumberColumn(format="¥%d"),
+                        "使用量": st.column_config.NumberColumn(format="%.2f L"),
+                    }
+                )
+                
+                st.markdown("---")
+                st.markdown("##### 📝 詳細データ (編集・フィルタ可能)")
 
-            # --- 2. フィルタ ---
-            unique_fuels = df["燃料名"].unique().tolist()
-            selected_fuels = st.multiselect("🔍 燃料名でフィルタ", unique_fuels, default=unique_fuels)
-            
-            if not selected_fuels:
-                view_df = df
-            else:
-                view_df = df[df["燃料名"].isin(selected_fuels)]
+                # --- 2. フィルタ ---
+                unique_fuels = df["燃料名"].unique().tolist()
+                selected_fuels = st.multiselect("🔍 燃料名でフィルタ", unique_fuels, default=unique_fuels)
+                
+                if not selected_fuels:
+                    view_df = df
+                else:
+                    view_df = df[df["燃料名"].isin(selected_fuels)]
 
-            # --- 3. 詳細エディタ ---
-            edited_df = st.data_editor(
-                view_df,
-                num_rows="dynamic", 
-                use_container_width=True,
-                hide_index=True,
-                key="editor_marker_mode_v1", 
-                column_config={
-                    "日付": st.column_config.TextColumn("日付"),
-                    "燃料名": st.column_config.TextColumn("燃料名"),
-                    "請求額": st.column_config.NumberColumn("請求額(円)", format="¥%d"),
-                    "使用量": st.column_config.NumberColumn("使用量(L)", format="%.2f L"),
-                }
-            )
-            
-            # --- 4. 同期処理 ---
-            if not edited_df.equals(view_df):
-                new_main_df = st.session_state['df'].copy()
+                # --- 3. 詳細エディタ ---
+                edited_df = st.data_editor(
+                    view_df,
+                    num_rows="dynamic", 
+                    use_container_width=True,
+                    hide_index=True,
+                    key="editor_canvas_fix_v2", 
+                    column_config={
+                        "日付": st.column_config.TextColumn("日付"),
+                        "燃料名": st.column_config.TextColumn("燃料名"),
+                        "請求額": st.column_config.NumberColumn("請求額(円)", format="¥%d"),
+                        "使用量": st.column_config.NumberColumn("使用量(L)", format="%.2f L"),
+                    }
+                )
                 
-                # 削除の反映
-                deleted_indices = set(view_df.index) - set(edited_df.index)
-                if deleted_indices:
-                    new_main_df = new_main_df.drop(list(deleted_indices))
-                
-                # 更新の反映
-                common_indices = list(set(edited_df.index) & set(new_main_df.index))
-                if common_indices:
-                    new_main_df.update(edited_df.loc[common_indices])
-                
-                # 追加の反映
-                new_rows = edited_df[~edited_df.index.isin(view_df.index)]
-                if not new_rows.empty:
-                    new_main_df = pd.concat([new_main_df, new_rows], ignore_index=True)
-                
-                st.session_state['df'] = new_main_df.reset_index(drop=True)
-                st.rerun()
+                # --- 4. 同期処理 ---
+                if not edited_df.equals(view_df):
+                    new_main_df = st.session_state['df'].copy()
+                    
+                    deleted_indices = set(view_df.index) - set(edited_df.index)
+                    if deleted_indices:
+                        new_main_df = new_main_df.drop(list(deleted_indices))
+                    
+                    common_indices = list(set(edited_df.index) & set(new_main_df.index))
+                    if common_indices:
+                        new_main_df.update(edited_df.loc[common_indices])
+                    
+                    new_rows = edited_df[~edited_df.index.isin(view_df.index)]
+                    if not new_rows.empty:
+                        new_main_df = pd.concat([new_main_df, new_rows], ignore_index=True)
+                    
+                    st.session_state['df'] = new_main_df.reset_index(drop=True)
+                    st.rerun()
 
-            csv = df.to_csv(index=False).encode('utf-8-sig')
-            st.download_button("CSVダウンロード", csv, "fuel_data.csv", "text/csv", use_container_width=True)
+                csv = df.to_csv(index=False).encode('utf-8-sig')
+                st.download_button("CSVダウンロード", csv, "fuel_data.csv", "text/csv", use_container_width=True)
