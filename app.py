@@ -8,7 +8,7 @@ import fitz  # PyMuPDF
 import re
 
 # --- ページ設定 ---
-st.set_page_config(layout="wide", page_title="燃料明細OCR (Fix JSON)")
+st.set_page_config(layout="wide", page_title="燃料明細OCR (Limiter)")
 st.title("⛽ 燃料明細 自動抽出ツール")
 st.caption(f"System Version: {st.__version__}")
 
@@ -67,21 +67,26 @@ def get_pdf_images(file_bytes, texts_to_highlight=None):
         images.append(Image.open(io.BytesIO(img_data)))
     return images
 
-# --- 関数: 強力なJSON抽出 ---
+# --- 関数: JSON抽出 (修復機能付き) ---
 def extract_json(text):
-    """AIの回答からJSON部分だけを無理やり抜き出す"""
+    """AIの回答からJSON部分を抜き出し、壊れていれば修復を試みる"""
     try:
-        # 最初の '{' と 最後の '}' を探す
+        # 1. 素直にパースできるか
+        return json.loads(text)
+    except:
+        pass
+
+    try:
+        # 2. { ... } の範囲を探す
         start = text.find('{')
         end = text.rfind('}') + 1
         if start != -1 and end != -1:
             json_str = text[start:end]
             return json.loads(json_str)
-        else:
-            # 見つからない場合は通常パースを試みる
-            return json.loads(text)
-    except json.JSONDecodeError:
-        return None
+    except:
+        pass
+    
+    return None
 
 # --- メイン処理 ---
 uploaded_file = st.file_uploader("請求書(PDF/画像)をアップロード", type=["pdf", "png", "jpg"])
@@ -137,7 +142,7 @@ if uploaded_file and api_key and selected_model_name:
                      inputs.append(img)
 
                 prompt = """
-                請求書画像を解析し、以下の情報をJSON形式のみで出力してください。Markdownのコードブロック（```json）は不要です。
+                請求書画像を解析し、以下の情報をJSON形式のみで出力してください。Markdown不要。
                 
                 1. **items**: 以下のリスト
                    - 日付 (MM-DD)
@@ -148,8 +153,12 @@ if uploaded_file and api_key and selected_model_name:
                 """
                 
                 with st.spinner("解析中..."):
-                    res = model.generate_content([prompt] + inputs)
-                    # ここで新しい抽出関数を使う
+                    # generation_config で暴走を止める (最大2000トークン)
+                    res = model.generate_content(
+                        [prompt] + inputs,
+                        generation_config=genai.types.GenerationConfig(max_output_tokens=2000)
+                    )
+                    
                     data = extract_json(res.text)
                     
                     if data:
@@ -158,25 +167,22 @@ if uploaded_file and api_key and selected_model_name:
                         st.session_state['highlight_text'] = []
                         st.toast("完了", icon="✅")
                     else:
-                        st.error("AIからの回答を解析できませんでした。")
-                        with st.expander("AIの生の回答を確認"):
-                            st.text(res.text)
+                        st.error("AIの回答が解析できませんでした（暴走の可能性があります）。")
+                        # デバッグ用に最初の500文字だけ表示
+                        with st.expander("回答の一部を確認"):
+                            st.text(res.text[:500] + "...")
 
             except Exception as e:
                 st.error(f"エラー: {e}")
 
         if not st.session_state['df'].empty:
             df = st.session_state['df']
-            # エラー防止のためインデックスをリセット
             df.reset_index(drop=True, inplace=True)
-            
             df["使用量"] = pd.to_numeric(df["使用量"], errors='coerce').fillna(0)
             df["請求額"] = pd.to_numeric(df["請求額"], errors='coerce').fillna(0)
 
             st.markdown(f"**💰 消費税:** `{st.session_state.get('tax_type')}`")
 
-            # 集計サマリ
-            st.markdown("##### 📊 集計サマリ")
             summary_df = df.groupby("燃料名")[["使用量", "請求額"]].sum().reset_index()
             total_row = pd.DataFrame({
                 "燃料名": ["🔴 合計"],
@@ -200,7 +206,7 @@ if uploaded_file and api_key and selected_model_name:
                 df,
                 use_container_width=True,
                 hide_index=True,
-                key="editor_final",
+                key="editor_limit",
                 selection_mode="single-row",
                 column_config={
                     "日付": st.column_config.TextColumn(),
@@ -210,9 +216,8 @@ if uploaded_file and api_key and selected_model_name:
                 }
             )
             
-            # ハイライト処理
-            if "editor_final" in st.session_state and st.session_state.editor_final.get("selection"):
-                selection = st.session_state.editor_final["selection"]
+            if "editor_limit" in st.session_state and st.session_state.editor_limit.get("selection"):
+                selection = st.session_state.editor_limit["selection"]
                 if selection.get("rows"):
                     row_idx = selection["rows"][0]
                     if row_idx < len(edited_df):
