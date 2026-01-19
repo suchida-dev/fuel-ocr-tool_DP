@@ -7,11 +7,11 @@ import io
 import fitz  # PyMuPDF
 
 # --- ページ設定 ---
-st.set_page_config(layout="wide", page_title="燃料明細OCR (Safe)")
+st.set_page_config(layout="wide", page_title="燃料明細OCR (v1.53)")
 st.title("⛽ 燃料明細 自動抽出ツール")
 
-# --- バージョンデバッグ表示 (画面左上に小さく出ます) ---
-st.caption(f"Streamlit Version: {st.__version__}")
+# デバッグ表示（確認用）
+st.caption(f"System Version: {st.__version__} (OK)")
 
 # --- CSS ---
 st.markdown("""
@@ -56,7 +56,6 @@ def get_pdf_images(file_bytes, texts_to_highlight=None):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     images = []
     for page in doc:
-        # ハイライト描画
         if texts_to_highlight:
             for text in texts_to_highlight:
                 if text and len(str(text)) > 0:
@@ -64,7 +63,6 @@ def get_pdf_images(file_bytes, texts_to_highlight=None):
                     for quad in quads:
                         page.draw_rect(quad, color=(1, 0, 0), width=0, fill=(1, 0, 0), fill_opacity=0.3)
                         page.draw_rect(quad, color=(1, 0, 0), width=1.5)
-
         pix = page.get_pixmap(dpi=150)
         img_data = pix.tobytes("png")
         images.append(Image.open(io.BytesIO(img_data)))
@@ -87,7 +85,6 @@ if uploaded_file and api_key and selected_model_name:
     file_bytes = uploaded_file.read()
     col1, col2 = st.columns([1.5, 1])
 
-    # --- 左: ビューア ---
     with col1:
         c1, c2, c3, c4, c5, _ = st.columns([1,1,1,1,1,5])
         with c1: st.button("➕", on_click=lambda: st.session_state.update({'zoom_level': st.session_state['zoom_level']+25}), help="拡大")
@@ -110,7 +107,6 @@ if uploaded_file and api_key and selected_model_name:
                     img = img.rotate(st.session_state['rotation'], expand=True)
                 st.image(img, width=current_width)
 
-    # --- 右: 操作 ---
     with col2:
         if st.button("🚀 抽出実行", type="primary", use_container_width=True):
             try:
@@ -120,26 +116,20 @@ if uploaded_file and api_key and selected_model_name:
                     raw_images = get_pdf_images(file_bytes, None)
                 else:
                     raw_images = [Image.open(io.BytesIO(file_bytes))]
-
                 for img in raw_images:
                      if st.session_state['rotation']:
                         img = img.rotate(st.session_state['rotation'], expand=True)
                      inputs.append(img)
 
                 prompt = """
-                請求書画像を解析し、以下の情報をJSON形式のみで出力してください。Markdown不要。
-                
+                請求書画像を解析し、以下の情報をJSON形式のみで出力してください。
                 1. **items**: 以下のリスト
                    - 日付 (MM-DD)
                    - 燃料名 (ガソリン, 軽油, 灯油, 重油, 軽油税などCO2排出対象のみ。洗車等は除外)
                    - 使用量 (L) 数値
                    - 請求額 (円) 数値
-                   - 合計行は除外
                 2. **tax**: "税込" or "税抜"
-                
-                Format: {"tax": "税込", "items": [{"日付": "01-15", "燃料名": "軽油", "使用量": 50.0, "請求額": 8000}]}
                 """
-                
                 with st.spinner("解析中..."):
                     res = model.generate_content([prompt] + inputs)
                     text = res.text.replace("```json", "").replace("```", "").strip()
@@ -148,20 +138,22 @@ if uploaded_file and api_key and selected_model_name:
                     st.session_state['df'] = pd.DataFrame(data["items"])
                     st.session_state['tax_type'] = data.get("tax", "不明")
                     st.session_state['highlight_text'] = []
-                    st.toast("抽出完了", icon="✅")
+                    st.toast("完了", icon="✅")
 
             except Exception as e:
                 st.error(f"エラー: {e}")
 
-        # --- 結果表示 ---
         if not st.session_state['df'].empty:
             df = st.session_state['df']
+            # エラー防止のためインデックスをリセット
+            df.reset_index(drop=True, inplace=True)
+            
             df["使用量"] = pd.to_numeric(df["使用量"], errors='coerce').fillna(0)
             df["請求額"] = pd.to_numeric(df["請求額"], errors='coerce').fillna(0)
 
-            st.markdown(f"**💰 消費税区分:** `{st.session_state.get('tax_type')}`")
+            st.markdown(f"**💰 消費税:** `{st.session_state.get('tax_type')}`")
 
-            # 集計サマリ
+            # 集計
             st.markdown("##### 📊 集計サマリ")
             summary_df = df.groupby("燃料名")[["使用量", "請求額"]].sum().reset_index()
             total_row = pd.DataFrame({
@@ -182,63 +174,46 @@ if uploaded_file and api_key and selected_model_name:
             st.markdown("---")
             st.markdown("##### 📝 詳細データ")
 
-            # --- 【ここが防弾仕様】エラー回避ロジック ---
-            try:
-                # 1. まず、新しい機能(クリックで光る)を試す
-                edited_df = st.data_editor(
-                    df,
-                    num_rows="fixed", # 新機能を使うときは fixed が必須
-                    use_container_width=True,
-                    hide_index=True,
-                    key="editor_new",
-                    selection_mode="single-row", # これが新機能
-                    column_config={
-                        "日付": st.column_config.TextColumn(),
-                        "燃料名": st.column_config.TextColumn(),
-                        "請求額": st.column_config.NumberColumn(format="¥%d"),
-                        "使用量": st.column_config.NumberColumn(format="%.2f L"),
-                    }
-                )
+            # --- ここが修正ポイント ---
+            # 1. num_rows="fixed" を削除 (デフォルト任せにする)
+            # 2. try-except を削除 (1.53.0ならエラーは出ないはず)
+            edited_df = st.data_editor(
+                df,
+                use_container_width=True,
+                hide_index=True,
+                key="editor_v153",      # キーを一新
+                selection_mode="single-row", # これが機能します
+                column_config={
+                    "日付": st.column_config.TextColumn(),
+                    "燃料名": st.column_config.TextColumn(),
+                    "請求額": st.column_config.NumberColumn(format="¥%d"),
+                    "使用量": st.column_config.NumberColumn(format="%.2f L"),
+                }
+            )
+            
+            # ハイライト処理
+            if "editor_v153" in st.session_state and st.session_state.editor_v153.get("selection"):
+                selection = st.session_state.editor_v153["selection"]
+                if selection.get("rows"):
+                    row_idx = selection["rows"][0]
+                    if row_idx < len(edited_df):
+                        selected_row = edited_df.iloc[row_idx]
+                        targets = [
+                            str(selected_row["日付"]),
+                            str(int(selected_row["請求額"])), 
+                            str(selected_row["燃料名"])
+                        ]
+                        if st.session_state['highlight_text'] != targets:
+                            st.session_state['highlight_text'] = targets
+                            st.rerun()
+            else:
+                if st.session_state['highlight_text']:
+                    st.session_state['highlight_text'] = []
+                    st.rerun()
 
-                # ハイライト処理（新機能が成功した場合のみ実行）
-                if "editor_new" in st.session_state and st.session_state.editor_new.get("selection"):
-                    selection = st.session_state.editor_new["selection"]
-                    if selection.get("rows"):
-                        row_idx = selection["rows"][0]
-                        if row_idx < len(edited_df):
-                            selected_row = edited_df.iloc[row_idx]
-                            targets = [str(selected_row["日付"]), str(int(selected_row["請求額"])), str(selected_row["燃料名"])]
-                            if st.session_state['highlight_text'] != targets:
-                                st.session_state['highlight_text'] = targets
-                                st.rerun()
-                else:
-                    if st.session_state['highlight_text']:
-                        st.session_state['highlight_text'] = []
-                        st.rerun()
-
-            except TypeError:
-                # 2. もしバージョンが古くてエラーが出たら、ここへ逃げる
-                # 新機能を使わない「普通の表」を表示する
-                st.warning("⚠️ アプリのバージョンが古いため、ハイライト機能は無効化されています。")
-                edited_df = st.data_editor(
-                    df,
-                    num_rows="dynamic", # 古いモードなら行追加もできる
-                    use_container_width=True,
-                    hide_index=True,
-                    key="editor_fallback",
-                    column_config={
-                        "日付": st.column_config.TextColumn(),
-                        "燃料名": st.column_config.TextColumn(),
-                        "請求額": st.column_config.NumberColumn(format="¥%d"),
-                        "使用量": st.column_config.NumberColumn(format="%.2f L"),
-                    }
-                )
-
-            # データ修正の反映
             if not edited_df.equals(st.session_state['df']):
                 st.session_state['df'] = edited_df
                 st.rerun() 
 
-            # CSVダウンロード
             csv = edited_df.to_csv(index=False).encode('utf-8-sig')
             st.download_button("CSVダウンロード", csv, "fuel_data.csv", "text/csv", use_container_width=True)
