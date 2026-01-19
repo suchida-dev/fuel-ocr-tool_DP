@@ -139,4 +139,30 @@ if uploaded_file and api_key and selected_model_name:
                 # 正常な燃料データの場合のみ処理を続行
                 try:
                     df["使用量"] = pd.to_numeric(df["使用量"], errors='coerce').fillna(0)
-                    df["請求額"] = pd.to_numeric(df["
+                    df["請求額"] = pd.to_numeric(df["請求額"], errors='coerce').fillna(0)
+
+                    st.markdown(f"**💰 消費税区分:** `{tax_type}`")
+                    st.markdown("##### ⛽ 燃料別合計")
+                    
+                    grouped = df.groupby("燃料名")[["使用量", "請求額"]].sum().reset_index()
+                    for index, row in grouped.iterrows():
+                        usage_str = f"{row['使用量']:.2f} L" if row['使用量'] > 0 else "-"
+                        st.info(f"**{row['燃料名']}**: {usage_str} / ¥{row['請求額']:,.0f}")
+
+                    st.markdown("---")
+
+                    edited_df = st.data_editor(
+                        df,
+                        num_rows="dynamic",
+                        use_container_width=True,
+                        column_config={
+                            "請求額": st.column_config.NumberColumn(format="¥%d"),
+                            "使用量": st.column_config.NumberColumn(format="%.2f L"),
+                        }
+                    )
+                    
+                    csv = edited_df.to_csv(index=False).encode('utf-8-sig')
+                    st.download_button("CSVダウンロード", csv, "fuel_data.csv", "text/csv")
+
+                except Exception as e:
+                    st.error(f"データ処理中に予期せぬエラーが発生しました: {e}")
