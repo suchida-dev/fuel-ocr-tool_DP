@@ -5,13 +5,13 @@ import pandas as pd
 import json
 import io
 import fitz  # PyMuPDF
-import base64
+from streamlit_pdf_viewer import pdf_viewer  # 【追加】専用ライブラリ
 
 # --- ページ設定 ---
-st.set_page_config(layout="wide", page_title="燃料明細OCR (全ページ対応版)")
+st.set_page_config(layout="wide", page_title="燃料明細OCR (PDFビューア版)")
 st.title("⛽ 燃料明細 自動抽出ツール")
 
-# --- 1. APIキー設定 (Secrets対応版) ---
+# --- 1. APIキー設定 ---
 api_key = None
 if "GEMINI_API_KEY" in st.secrets:
     api_key = st.secrets["GEMINI_API_KEY"]
@@ -20,7 +20,7 @@ else:
     api_key_input = st.sidebar.text_input("Gemini API Key", type="password")
     api_key = api_key_input.strip() if api_key_input else None
 
-# --- 2. モデルの動的取得 ---
+# --- 2. モデル取得 ---
 available_model_names = []
 if api_key:
     genai.configure(api_key=api_key, transport='rest')
@@ -36,47 +36,31 @@ if api_key:
 
 selected_model_name = None
 if available_model_names:
-    selected_model_name = st.sidebar.selectbox(
-        "使用するモデル", 
-        available_model_names
-    )
+    selected_model_name = st.sidebar.selectbox("使用するモデル", available_model_names)
 
 # --- 3. ファイルアップロード ---
 uploaded_file = st.file_uploader("請求書(PDF/画像)をアップロード", type=["pdf", "png", "jpg", "jpeg"])
 
-# --- 関数: PDF全ページを画像リストに変換 (解析用) ---
+# --- 関数: 解析用にPDFを画像リストに変換 ---
 def pdf_to_all_images(file_bytes):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     images = []
-    # 全ページをループして画像化
     for page in doc:
         pix = page.get_pixmap()
         img_data = pix.tobytes("png")
         images.append(Image.open(io.BytesIO(img_data)))
     return images
 
-# --- 関数: PDFを埋め込み表示 (プレビュー用) ---
-def display_pdf(file_bytes):
-    # バイナリをBase64文字列に変換
-    base64_pdf = base64.b64encode(file_bytes).decode('utf-8')
-    # iframeタグで埋め込む (高さ800px, 幅100%)
-    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="800px" type="application/pdf"></iframe>'
-    st.markdown(pdf_display, unsafe_allow_html=True)
-
 # --- メイン処理 ---
 if uploaded_file and api_key and selected_model_name:
     
-    # ファイルの中身をバイト列として読み込む
+    # ファイル読み込み
     file_bytes = uploaded_file.read()
-    
-    # データの準備
-    input_contents = [] # Geminiに渡すデータリスト
+    input_contents = [] 
     
     if uploaded_file.type == "application/pdf":
-        # 解析用: 全ページを画像リストにする
         input_contents = pdf_to_all_images(file_bytes)
     else:
-        # 画像の場合
         image = Image.open(io.BytesIO(file_bytes))
         input_contents = [image]
 
@@ -85,9 +69,10 @@ if uploaded_file and api_key and selected_model_name:
 
     with col1:
         st.subheader("📄 原本プレビュー")
+        # 【修正】ここを専用ライブラリに変更しました
         if uploaded_file.type == "application/pdf":
-            # PDFビューアを表示 (スクロール・拡大縮小可能)
-            display_pdf(file_bytes)
+            # widthは親カラムに合わせて自動調整、高さはスクロール可能
+            pdf_viewer(input=file_bytes, width=700, height=800)
         else:
             st.image(input_contents[0], use_container_width=True)
 
@@ -102,24 +87,22 @@ if uploaded_file and api_key and selected_model_name:
                 
                 prompt = """
                 このガソリンスタンドの請求書（全ページ）を解析してください。
-                以下の3つの情報を抽出し、必ず指定のJSON形式で出力してください。
-                Markdownコードブロックは不要です。生JSONのみ返してください。
+                以下の情報を抽出し、JSON形式で出力してください。Markdownは不要です。
 
                 1. **明細リスト**: 日付、燃料名、使用量(L)、請求額(円)
-                   - ページをまたいでいる場合もすべて抽出すること。
-                   - 「軽油税」が個別の行として記載されている場合は、それも明細行として抽出すること。
-                   - 明細以外の「合計」行は除外すること。
-                2. **税区分**: 書類全体を見て、金額が「税込」か「税抜」か判定すること。
-                3. **メタ情報**: その他気づいたことがあれば記述。
-
+                   - ページをまたいでいる場合もすべて抽出。
+                   - 軽油税が別行ならそれも明細として抽出。
+                   - 明細以外の「合計」行は除外。
+                2. **税区分**: "税込" または "税抜"
+                
                 出力JSONフォーマット:
                 {
                     "tax_type": "税込" または "税抜",
                     "items": [
                         {
                             "日付": "MM-DD",
-                            "燃料名": "レギュラー、軽油、軽油税など",
-                            "使用量": 数値(数値がない場合は 0),
+                            "燃料名": "名称",
+                            "使用量": 数値,
                             "請求額": 数値
                         }
                     ]
@@ -127,7 +110,6 @@ if uploaded_file and api_key and selected_model_name:
                 数値にはカンマや円マークを入れないでください。
                 """
                 
-                # プロンプトと全画像のリストをまとめて渡す
                 request_content = [prompt] + input_contents
 
                 with st.spinner("全ページ解析中..."):
@@ -146,19 +128,16 @@ if uploaded_file and api_key and selected_model_name:
             except Exception as e:
                 st.error(f"エラーが発生しました: {e}")
 
-        # --- 結果表示とエラーハンドリング ---
+        # 結果表示
         if 'df' in st.session_state:
             df = st.session_state['df']
             tax_type = st.session_state.get('tax_type', '不明')
 
-            # カラムチェック
             required_cols = ["使用量", "請求額", "燃料名"]
             missing_cols = [c for c in required_cols if c not in df.columns]
 
             if missing_cols:
                 st.error("電気もしくはガスのデータです。データを再確認してください。")
-                with st.expander("詳細データ（参考）"):
-                    st.dataframe(df)
             else:
                 try:
                     df["使用量"] = pd.to_numeric(df["使用量"], errors='coerce').fillna(0)
@@ -175,9 +154,7 @@ if uploaded_file and api_key and selected_model_name:
                     st.markdown("---")
 
                     edited_df = st.data_editor(
-                        df,
-                        num_rows="dynamic",
-                        use_container_width=True,
+                        df, num_rows="dynamic", use_container_width=True,
                         column_config={
                             "請求額": st.column_config.NumberColumn(format="¥%d"),
                             "使用量": st.column_config.NumberColumn(format="%.2f L"),
@@ -188,4 +165,4 @@ if uploaded_file and api_key and selected_model_name:
                     st.download_button("CSVダウンロード", csv, "fuel_data.csv", "text/csv")
 
                 except Exception as e:
-                    st.error(f"データ処理中に予期せぬエラーが発生しました: {e}")
+                    st.error(f"データ処理中にエラー: {e}")
