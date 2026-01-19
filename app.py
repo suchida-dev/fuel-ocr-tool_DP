@@ -10,20 +10,9 @@ import fitz  # PyMuPDF
 st.set_page_config(layout="wide", page_title="燃料明細OCR (Pro UI)")
 st.title("⛽ 燃料明細 自動抽出ツール")
 
-# --- CSS: 画像表示エリアを固定サイズにしてスクロール可能にする ---
+# --- CSS: ボタンのデザイン調整のみ残す ---
 st.markdown("""
     <style>
-    /* 画像を表示する枠のスタイル */
-    .img-scroll-container {
-        height: 750px;       /* 高さを固定 */
-        overflow: auto;      /* はみ出たらスクロールバーを出す */
-        border: 1px solid #e0e0e0;
-        border-radius: 5px;
-        background-color: #f0f2f6;
-        text-align: center;
-        display: block;
-    }
-    /* ボタンを小さくするハック */
     .stButton button {
         padding: 0px 10px;
         font-weight: bold;
@@ -69,7 +58,6 @@ def pdf_to_all_images(file_bytes):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     images = []
     for page in doc:
-        # 画質を高めに設定 (dpi=200)
         pix = page.get_pixmap(dpi=200)
         img_data = pix.tobytes("png")
         images.append(Image.open(io.BytesIO(img_data)))
@@ -90,12 +78,10 @@ if uploaded_file and api_key and selected_model_name:
         input_contents = [image]
 
     # --- 画面構成 ---
-    # 左側の比率を少し大きく確保
     col1, col2 = st.columns([1.8, 1])
 
     with col1:
-        # --- コントロールバー (ボタンをコンパクトに配置) ---
-        # 7分割して中央に寄せるイメージ、あるいは端に寄せる
+        # --- コントロールバー ---
         c1, c2, c3, c4, c5, c_spacer = st.columns([1, 1, 1, 1, 1, 4])
         
         def zoom_in(): st.session_state['zoom_level'] += 25
@@ -113,23 +99,19 @@ if uploaded_file and api_key and selected_model_name:
         with c5: st.button("R", on_click=reset_view, help="リセット", use_container_width=True)
 
         # --- 画像表示エリア (スクロール枠) ---
-        # widthを計算 (基本幅 * ズーム率)
-        # CSSで枠を作っているので、画像がはみ出すと自動でスクロールバーが出ます
-        base_width = 800 # 基準サイズ
-        current_width = int(base_width * (st.session_state['zoom_level'] / 100))
-        
-        # 枠の開始タグ
-        st.markdown('<div class="img-scroll-container">', unsafe_allow_html=True)
-        
-        for img in input_contents:
-            if st.session_state['rotation'] != 0:
-                img = img.rotate(st.session_state['rotation'], expand=True)
+        # 【修正ポイント】 heightパラメータを使うことで、公式機能として枠内スクロールを実現します
+        with st.container(height=750):
             
-            st.image(img, width=current_width)
-            st.markdown("<br>", unsafe_allow_html=True) # ページ間の隙間
+            # ズーム倍率に応じた幅を計算 (基準幅800px)
+            current_width = int(800 * (st.session_state['zoom_level'] / 100))
             
-        # 枠の終了タグ
-        st.markdown('</div>', unsafe_allow_html=True)
+            for img in input_contents:
+                # 回転処理
+                if st.session_state['rotation'] != 0:
+                    img = img.rotate(st.session_state['rotation'], expand=True)
+                
+                # 画像を表示
+                st.image(img, width=current_width)
 
     with col2:
         st.subheader("📊 抽出結果")
@@ -140,7 +122,6 @@ if uploaded_file and api_key and selected_model_name:
             try:
                 model = genai.GenerativeModel(selected_model_name)
                 
-                # 回転状態を反映した画像リストを作成
                 processed_inputs = []
                 for img in input_contents:
                     if st.session_state['rotation'] != 0:
@@ -189,7 +170,6 @@ if uploaded_file and api_key and selected_model_name:
             except Exception as e:
                 st.error(f"エラーが発生しました: {e}")
 
-        # 結果表示
         if 'df' in st.session_state:
             df = st.session_state['df']
             tax_type = st.session_state.get('tax_type', '不明')
